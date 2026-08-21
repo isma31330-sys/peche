@@ -1,122 +1,75 @@
 import streamlit as st
 import requests
-from datetime import datetime
+import pandas as pd
 
-st.set_page_config(page_title="Aide à la Décision - Pêche au Bar V3+", layout="centered")
+st.set_page_config(page_title="Aide à la Décision - Pêche au Bar V3+", layout="wide")
 
 st.title("🎣 Aide à la Décision V3+ — Pêche au Bar")
-st.caption("Zone 50km Le Croisic & Côte Sauvage | Météo & Marée Temps Réel")
+st.caption("Zone 50km Le Croisic & Côte Sauvage | Prévisions 15J & Océanogramme SHOM")
 
-# Mapping des spots avec coordonnées GPS et identifiant de port maree.info (Le Croisic / St-Nazaire / Piriac)
+# Coordonnées GPS et identifiants des ports
 SPOTS = {
-    "Côte Sauvage (Le Croisic)": {"lat": 47.2931, "lon": -2.5204, "port_id": "80"},     # Le Croisic
-    "Pointe du Castelli (Piriac)": {"lat": 47.3781, "lon": -2.5512, "port_id": "80"},   # Le Croisic
-    "Baie de Mesquer": {"lat": 47.3986, "lon": -2.4635, "port_id": "80"},           # Le Croisic
-    "Estuaire de la Loire": {"lat": 47.2300, "lon": -2.1800, "port_id": "82"},      # St-Nazaire
-    "Île de Dumet": {"lat": 47.4111, "lon": -2.6208, "port_id": "80"}              # Le Croisic
+    "Côte Sauvage (Le Croisic)": {"lat": 47.2931, "lon": -2.5204, "port_id": "80"},
+    "Pointe du Castelli (Piriac)": {"lat": 47.3781, "lon": -2.5512, "port_id": "80"},
+    "Baie de Mesquer": {"lat": 47.3986, "lon": -2.4635, "port_id": "80"},
+    "Estuaire de la Loire": {"lat": 47.2300, "lon": -2.1800, "port_id": "82"},
+    "Île de Dumet": {"lat": 47.4111, "lon": -2.6208, "port_id": "80"}
 }
 
-# Clé API maree.info (à configurer dans les Secrets Streamlit ou à coller ici)
 MAREE_API_KEY = st.secrets.get("MAREE_API_KEY", "VOTRE_CLE_API_MAREE")
 
-# 1. Sélection du Spot et du Créneau
-st.header("1. Localisation & Moment")
-col1, col2 = st.columns(2)
+# 1. Sélection du spot
+spot_nom = st.selectbox("Secteur de pêche", list(SPOTS.keys()))
+coords = SPOTS[spot_nom]
 
-with col1:
-    spot_nom = st.selectbox("Secteur de pêche", list(SPOTS.keys()))
-    coords = SPOTS[spot_nom]
-
-with col2:
-    moment = st.selectbox(
-        "Moment du jour",
-        ["Aube (Coup du matin)", "Matin (Lumière douce)", "Après-Midi (Plein soleil)", "Crépuscule (Coup du soir)", "Nuit"]
-    )
-
-# 2. Récupération Météo (Open-Meteo)
-@st.cache_data(ttl=1800)
-def fetch_weather_data(lat, lon):
-    url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current=surface_pressure,wind_speed_10m,wind_direction_10m&hourly=surface_pressure&forecast_days=1"
-    res = requests.get(url).json()
-    current = res.get("current", {})
-    hourly = res.get("hourly", {})
-    
-    pression = current.get("surface_pressure", 1013.25)
-    vent_vitesse = current.get("wind_speed_10m", 15.0)
-    vent_dir = current.get("wind_direction_10m", 270)
-    
-    pressions_hourly = hourly.get("surface_pressure", [])
-    delta_p = (pressions_hourly[3] - pressions_hourly[0]) if len(pressions_hourly) >= 4 else 0.0
-    return pression, vent_vitesse, vent_dir, delta_p
-
-# 3. Récupération Marée (api.maree.info)
+# 2. Récupération Météo 16 jours (Open-Meteo API)
 @st.cache_data(ttl=3600)
-def fetch_tide_data(port_id, api_key):
-    url = f"http://api.maree.info/m/tide/{port_id}?token={api_key}"
-    try:
-        res = requests.get(url, timeout=5).json()
-        # Extraction du coefficient du jour et des horaires
-        coef = int(res["tide"][0]["coef"]) if "tide" in res and res["tide"] else 75
-        return coef, "Données live maree.info"
-    except Exception:
-        # Fallback si clé invalide ou API indisponible
-        return 75, "Valeur estimée (Mode secours)"
+def fetch_15day_forecast(lat, lon):
+    url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&daily=wind_speed_10m_max,wind_direction_10m_dominant,surface_pressure_mean&forecast_days=16&timezone=auto"
+    res = requests.get(url).json()
+    return res.get("daily", {})
 
-pression, vent_vitesse, vent_dir, delta_p = fetch_weather_data(coords["lat"], coords["lon"])
-coef_maree, status_maree = fetch_tide_data(coords["port_id"], MAREE_API_KEY)
+daily_data = fetch_15day_forecast(coords["lat"], coords["lon"])
 
-st.header("2. Conditions Météo & Marée (Temps Réel)")
+# 3. Calcul des scores sur 15 jours
+if daily_data:
+    dates = daily_data.get("time", [])
+    vitesse_vent = daily_data.get("wind_speed_10m_max", [])
+    dir_vent = daily_data.get("wind_direction_10m_dominant", [])
+    pression = daily_data.get("surface_pressure_mean", [])
 
-col_d1, col_d2, col_d3, col_d4 = st.columns(4)
-col_d1.metric("Pression", f"{pression:.1f} hPa", delta=f"{delta_p:.1f} hPa/3h")
-col_d2.metric("Vent", f"{vent_vitesse:.1f} km/h")
-col_d3.metric("Orientation Vent", f"{vent_dir}°")
-col_d4.metric("Coef. Marée", f"{coef_maree}", help=status_maree)
+    scores = []
+    for i in range(len(dates)):
+        # Calcul simplifié du score V3+ sur la tendance du jour
+        is_vent_mer = 200 <= dir_vent[i] <= 290
+        v_vent = 90 if (15 <= vitesse_vent[i] <= 25 and is_vent_mer) else 55
+        p_press = 85 if pression[i] < 1013 else 60
+        
+        # Estimation baseline score quotidien
+        score_jour = (0.35 * v_vent) + (0.35 * p_press) + (0.30 * 70)
+        scores.append(round(score_jour, 1))
 
-# Saisie manuelle restreinte aux paramètres non couverts par l'API
-st.subheader("Paramètres de la session")
-col_m1, col_m2 = st.columns(2)
-with col_m1:
-    fenetre_maree = st.selectbox("Fenêtre de marée", ["PM-2h à PM+1h (Optimal)", "Pleine Mer", "Basse Mer", "Autre"])
-    houle_hauteur = st.number_input("Hauteur de houle (m)", min_value=0.0, max_value=4.0, value=1.0, step=0.1)
-with col_m2:
-    carnet_historique = st.slider("Historique de succès (Score Carnet)", 0, 100, 70)
+    df_scores = pd.DataFrame({
+        "Date": dates,
+        "Score d'Activité (/100)": scores,
+        "Vent max (km/h)": vitesse_vent,
+        "Pression moyenne (hPa)": pression
+    }).set_index("Date")
 
-# 4. Calcul du Score V3+
-c_maree = 90 if (65 <= coef_maree <= 85 and "PM-2h" in fenetre_maree) else 60
-h_carnet = carnet_historique
-p_pression = 95 if (-3.0 <= delta_p <= -1.0) else 50
+    st.header("1. Prévision des Scores d'Activité sur 15 Jours")
+    col_g, col_t = st.columns([2, 1])
+    
+    with col_g:
+        st.line_chart(df_scores["Score d'Activité (/100)"])
+    with col_t:
+        st.dataframe(df_scores[["Score d'Activité (/100)", "Vent max (km/h)"]], height=280)
 
-mapping_moment = {
-    "Aube (Coup du matin)": 95,
-    "Crépuscule (Coup du soir)": 90,
-    "Nuit": 78,
-    "Matin (Lumière douce)": 65,
-    "Après-Midi (Plein soleil)": 48
-}
-m_moment = mapping_moment[moment]
-
-is_vent_mer = 200 <= vent_dir <= 290
-v_vent = 90 if (15 <= vent_vitesse <= 25 and is_vent_mer) else 55
-e_eau = 85 if (0.8 <= houle_hauteur <= 1.5) else 50
-
-# Score Global Algorithme V3+
-score_global = (0.25 * c_maree) + (0.20 * h_carnet) + (0.15 * p_pression) + (0.15 * m_moment) + (0.15 * v_vent) + (0.10 * e_eau)
-
-# 5. Restitution
+# 4. Vue Océanogramme SHOM
 st.divider()
-st.header("3. Indice d'Activité & Stratégie")
+st.header("2. Océanogramme SHOM (Prévisions Océanographiques à 4J)")
+st.caption("Données de houle, météo, mer et courants de surface directement issues du modèle SHOM / Météo-France.")
 
-st.metric(label=f"Score d'activité — {spot_nom}", value=f"{round(score_global, 1)} / 100")
+# URL de l'iframe de l'océanogramme dynamique SHOM
+shom_url = f"https://services.data.shom.fr/oceano/render/html/widget?duration=4&delta-date=0&lon={coords['lon']}&lat={coords['lat']}&utc=1&lang=fr"
 
-if "Aube" in moment or "Crépuscule" in moment:
-    technique = "Surface & Sub-surface (Chasses de bordure)"
-elif "Nuit" in moment:
-    technique = "Pêche lente au leurre dur / leurre souple près des berges"
-elif "Après-Midi" in moment:
-    technique = "Pêche creuse (cassants, sous-bois d'algues) ou leurre souple/jig"
-else:
-    technique = "Leurre souple à gratter ou jig léger"
-
-st.success(f"💡 **Technique recommandée** : {technique}")
-st.info("📌 **Pêche raisonnée** : Respectez la maille légale (42 cm) et préservez le milieu marin.")
+st.components.v1.iframe(shom_url, height=600, scrolling=True)
