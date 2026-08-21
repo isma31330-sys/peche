@@ -58,7 +58,6 @@ def fetch_current_weather(lat, lon):
 pression, vent_vitesse, vent_dir, delta_p = fetch_current_weather(coords["lat"], coords["lon"])
 
 # 3. Calcul des sous-scores pondérés (V3+)
-# a) Moment de la journée (15%)
 score_moment_map = {
     "Aube (Coup du matin)": 95,
     "Crépuscule (Coup du soir)": 90,
@@ -68,8 +67,6 @@ score_moment_map = {
 }
 sub_moment = score_moment_map[moment]
 
-# b) Marée & Courant (25%)[cite: 1]
-coef_maree = 75  # Récupéré ou fixe
 score_maree_map = {
     "PM-2h à PM+1h (Plein courant / Optimal)": 95,
     "Montante (Etale BM à PM)": 75,
@@ -78,28 +75,23 @@ score_maree_map = {
 }
 sub_maree = score_maree_map[etat_maree]
 
-# c) Pression Atmosphérique (15%)[cite: 1]
 sub_pression = 95 if (-3.0 <= delta_p <= -1.0) else (70 if delta_p < 0 else 45)
 
-# d) Vent & Orientation (15%)[cite: 1]
 is_vent_mer = 200 <= vent_dir <= 290
 sub_vent = 90 if (12 <= vent_vitesse <= 25 and is_vent_mer) else 55
 
-# e) Houle & Température Eau (10%)[cite: 1]
 sub_houle = 80
-
-# f) Carnet & Historique (20%)[cite: 1]
 sub_carnet = 75
 
 # Impact pondéré sur le score final (Base /100)
-contrib_maree = 0.25 * sub_maree[cite: 1]
-contrib_carnet = 0.20 * sub_carnet[cite: 1]
-contrib_pression = 0.15 * sub_pression[cite: 1]
-contrib_moment = 0.15 * sub_moment[cite: 1]
-contrib_vent = 0.15 * sub_vent[cite: 1]
-contrib_houle = 0.10 * sub_houle[cite: 1]
+contrib_maree = 0.25 * sub_maree
+contrib_carnet = 0.20 * sub_carnet
+contrib_pression = 0.15 * sub_pression
+contrib_moment = 0.15 * sub_moment
+contrib_vent = 0.15 * sub_vent
+contrib_houle = 0.10 * sub_houle
 
-score_global = contrib_maree + contrib_carnet + contrib_pression + contrib_moment + contrib_vent + contrib_houle[cite: 1]
+score_global = contrib_maree + contrib_carnet + contrib_pression + contrib_moment + contrib_vent + contrib_houle
 
 # 4. Affichage du Score et Décomposition
 st.divider()
@@ -110,7 +102,6 @@ col_res1, col_res2 = st.columns([1, 2])
 with col_res1:
     st.metric(label=f"Score d'Activité Global — {spot_nom}", value=f"{round(score_global, 1)} / 100")
     
-    # Recommandation dynamique
     if "Aube" in moment or "Crépuscule" in moment:
         st.success("💡 **Stratégie** : Leurres de surface & sub-surface (chasses de bordure).")
     elif "Nuit" in moment:
