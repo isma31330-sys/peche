@@ -5,15 +5,15 @@ import pandas as pd
 st.set_page_config(page_title="Aide à la Décision - Pêche au Bar V3+", layout="wide")
 
 st.title("🎣 Aide à la Décision V3+ — Pêche au Bar")
-st.caption("Zone 50km Le Croisic & Côte Sauvage | Prévisions Horaire 15J, Marée Synchronisée & Décomposition")
+st.caption("Zone 50km Le Croisic & Côte Sauvage | Prévisions 15J & Décomposition")
 
-# Spots GPS & ID Ports (Le Croisic = 80, St-Nazaire = 82)
+# 1. Configuration des Spots GPS
 SPOTS = {
-    "Côte Sauvage (Le Croisic)": {"lat": 47.2931, "lon": -2.5204, "port_id": "80"},
-    "Pointe du Castelli (Piriac)": {"lat": 47.3781, "lon": -2.5512, "port_id": "80"},
-    "Baie de Mesquer": {"lat": 47.3986, "lon": -2.4635, "port_id": "80"},
-    "Estuaire de la Loire": {"lat": 47.2300, "lon": -2.1800, "port_id": "82"},
-    "Île de Dumet": {"lat": 47.4111, "lon": -2.6208, "port_id": "80"}
+    "Côte Sauvage (Le Croisic)": {"lat": 47.2931, "lon": -2.5204},
+    "Pointe du Castelli (Piriac)": {"lat": 47.3781, "lon": -2.5512},
+    "Baie de Mesquer": {"lat": 47.3986, "lon": -2.4635},
+    "Estuaire de la Loire": {"lat": 47.2300, "lon": -2.1800},
+    "Île de Dumet": {"lat": 47.4111, "lon": -2.6208}
 }
 
 MOMENTS_MAP = {
@@ -24,46 +24,19 @@ MOMENTS_MAP = {
     "Nuit": 78
 }
 
-# 2. Fonction d'appel API Marée corrigée
-@st.cache_data(ttl=3600)
-def fetch_tide_info(port_id, target_date, api_key):
-    """
-    Interroge l'API pour la date exacte (YYYY-MM-DD) avec gestion d'erreurs
-    """
-    # Si la clé n'est pas renseignée dans secrets.toml
-    if not api_key or api_key == "VOTRE_CLE_API_MAREE":
-        return "N/A", "Clé MAREE_API_KEY non configurée dans Streamlit Secrets"
-
-    url = f"https://api-maree.fr/tide-extrema?key={api_key}&site={port_id}&from={target_date}&to={target_date}"
-    try:
-        response = requests.get(url, timeout=5)
-        if response.status_code == 200:
-            res = response.json()
-            if res.get("status") == "success" and target_date in res.get("data", {}):
-                day_data = res["data"][target_date]
-                coef = day_data.get("coefficient", "N/A")
-                
-                extrema = day_data.get("extrema", [])
-                horaires_list = [
-                    f"{e.get('time')} ({'PM' if e.get('state') == 'HIGH TIDE' else 'BM'})"
-                    for e in extrema if e.get("time")
-                ]
-                
-                str_horaires = " | ".join(horaires_list) if horaires_list else "Horaires indisponibles"
-                return coef, str_horaires
-        elif response.status_code in [401, 403]:
-            return "N/A", "Clé API invalide ou expirée"
-    except Exception as e:
-        pass
-
-    return "N/A", "Erreur de connexion à l'API Marée"
+# 2. Définition de coords en haut du script
+spot_nom = st.sidebar.selectbox("📍 Secteur de pêche", list(SPOTS.keys()))
+coords = SPOTS[spot_nom]
 
 # 3. Récupération Météo 16J (Open-Meteo)
 @st.cache_data(ttl=3600)
 def fetch_15day_hourly(lat, lon):
     url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&hourly=temperature_2m,surface_pressure,wind_speed_10m,wind_direction_10m&forecast_days=16&timezone=auto"
-    res = requests.get(url).json()
-    return res.get("hourly", {})
+    try:
+        res = requests.get(url, timeout=10).json()
+        return res.get("hourly", {})
+    except Exception:
+        return {}
 
 hourly_raw = fetch_15day_hourly(coords["lat"], coords["lon"])
 
@@ -93,7 +66,7 @@ if hourly_raw:
         "surface_pressure": "mean"
     }).reset_index()
 
-    # Calcul des sous-scores V3+
+    # Calcul des scores V3+
     def calculate_score(row):
         sub_moment = MOMENTS_MAP.get(row["moment"], 60)
         sub_maree = 85 if row["moment"] in ["Aube (Coup du matin)", "Crépuscule (Coup du soir)"] else 65
@@ -133,7 +106,6 @@ if hourly_raw:
     matrix_df = df_grouped.pivot(index="date", columns="moment", values="score_total")
     matrix_df = matrix_df.reindex(columns=[m for m in moments_order if m in matrix_df.columns])
 
-    # Affichage sécurisé de la matrice
     try:
         st.dataframe(
             matrix_df.style.background_gradient(cmap="RdYlGn", vmin=40, vmax=90).format("{:.1f}"),
@@ -143,18 +115,15 @@ if hourly_raw:
     except Exception:
         st.dataframe(matrix_df, use_container_width=True, height=400)
 
-    # 5. Inspection Détaillée & Marée Dynamique
+    # 5. Inspection Détaillée
     st.divider()
-    st.header("2. Analyse Détaillée du Créneau & Informations Marée")
+    st.header("2. Analyse Détaillée du Créneau")
     
     col_sel1, col_sel2 = st.columns(2)
     with col_sel1:
         selected_date = st.selectbox("Sélectionner la date", df_grouped["date"].unique())
     with col_sel2:
         selected_moment = st.selectbox("Sélectionner le créneau", moments_order)
-
-    # Appel de la marée pour la date SÉLECTIONNÉE
-    coef_maree, horaires_maree = fetch_tide_info(coords["port_id"], selected_date, MAREE_API_KEY)
 
     row_detail = df_grouped[(df_grouped["date"] == selected_date) & (df_grouped["moment"] == selected_moment)]
 
@@ -168,9 +137,6 @@ if hourly_raw:
                 label=f"Score Global ({selected_date} — {selected_moment[:4]})", 
                 value=f"{r['score_total']} / 100"
             )
-            
-            st.markdown("### 🌊 Marée du Jour (Dynamique)")
-            st.info(f"**Coefficient** : {coef_maree}\n\n**Horaires (BM/PM)** : {horaires_maree}")
 
             st.markdown("### 🍃 Conditions Météo")
             st.write(f"**Vent moyen** : {round(r['wind_speed_10m'], 1)} km/h ({round(r['wind_direction_10m'])}°)")
@@ -208,8 +174,8 @@ if hourly_raw:
             st.bar_chart(df_decomp["Points apportés"])
             st.table(df_decomp)
 
-# 6. Océanogramme SHOM
+# 6. Océanogramme SHOM pour les marées et courants exacts
 st.divider()
-st.header("3. Océanogramme SHOM")
+st.header("3. Océanogramme SHOM (Marée & Hauteur d'eau exactes)")
 shom_url = f"https://services.data.shom.fr/oceano/render/html/widget?duration=4&delta-date=0&lon={coords['lon']}&lat={coords['lat']}&utc=1&lang=fr"
 st.components.v1.iframe(shom_url, height=550, scrolling=True)
