@@ -96,7 +96,6 @@ if not df_weather.empty:
     df_weather["date"] = df_weather["time"].dt.strftime("%Y-%m-%d")
     df_weather["hour"] = df_weather["time"].dt.hour
 
-    # Fusion avec les données marines si disponibles
     if not df_marine.empty:
         df_weather = pd.merge_asof(df_weather.sort_values("time"), df_marine.sort_values("time"), on="time")
     else:
@@ -128,63 +127,71 @@ if not df_weather.empty:
         day_tide = tides_dict.get(date, {"max_coef": 70, "extrema": []})
         coef = day_tide["max_coef"]
 
-        # --- 1. Marée & Courant (25%) ---
-        if coef >= 85: note_maree, desc_maree = 5, f"Grand coefficient ({coef}) — Fort brassage"
-        elif coef >= 70: note_maree, desc_maree = 4, f"Bon coefficient ({coef}) — Très actif"
-        elif coef >= 55: note_maree, desc_maree = 3, f"Coefficient moyen ({coef})"
-        elif coef >= 40: note_maree, desc_maree = 2, f"Faible coefficient ({coef})"
-        else: note_maree, desc_maree = 1, f"Morte-eau ({coef})"
+        # --- 1. Marée & Coefficients (25%) ---
+        if coef >= 75: note_maree, desc_maree = 5, f"Excellent coefficient ({coef} >= 75) — Fortes veines de courant"
+        elif coef >= 60: note_maree, desc_maree = 4, f"Bon coefficient ({coef}) — Activité correcte"
+        elif coef >= 45: note_maree, desc_maree = 3, f"Coefficient moyen ({coef})"
+        elif coef >= 35: note_maree, desc_maree = 2, f"Faible coefficient ({coef})"
+        else: note_maree, desc_maree = 1, f"Morte-eau stricte ({coef}) — Absence de courant"
 
-        # --- 2. Carnet & Historique (20%) ---
-        note_carnet, desc_carnet = 3, "Historique neutre (En attente intégration de vos prises)"
-
-        # --- 3. Pression Atmosphérique (15%) ---
-        if pressure < 1008: note_press, desc_press = 5, f"Basse pression marquée ({round(pressure,1)} hPa)"
+        # --- 2. Pression Atmosphérique (20%) ---
+        if pressure < 1010: note_press, desc_press = 5, f"Dépression / Baisse marquée ({round(pressure,1)} hPa) — Idéal"
         elif pressure < 1015: note_press, desc_press = 4, f"Pression favorable ({round(pressure,1)} hPa)"
         elif pressure <= 1022: note_press, desc_press = 3, f"Pression stable ({round(pressure,1)} hPa)"
-        else: note_press, desc_press = 2, f"Haute pression anticyclonique ({round(pressure,1)} hPa)"
+        else: note_press, desc_press = 2, f"Anticyclone durable ({round(pressure,1)} hPa) — Plus difficile"
+
+        # --- 3. Vent, Houle & Orientation (20%) ---
+        is_vent_favorable = 180 <= wind_dir <= 310  # Secteur Sud à Nord-Ouest
+        if 12 <= wind_speed <= 30 and is_vent_favorable and wave_height >= 0.8:
+            note_vent, desc_vent = 5, f"Vent Sud/Ouest ({round(wind_speed,1)} km/h) & Houle ({round(wave_height,1)}m) — Parfait"
+        elif 10 <= wind_speed <= 35:
+            note_vent, desc_vent = 4, f"Vent modéré ({round(wind_speed,1)} km/h)"
+        elif wind_speed < 8:
+            note_vent, desc_vent = 1, f"Calme plat total ({round(wind_speed,1)} km/h) / Eaux trop claires"
+        else:
+            note_vent, desc_vent = 2, f"Vent excessif ou secteur Nord/Est"
 
         # --- 4. Moment du Jour & Luminosité (15%) ---
         if moment in ["Aube (Coup du matin)", "Crépuscule (Coup du soir)"]:
-            note_moment, desc_moment = (5, f"{moment} avec {round(cloud_cover)}% de nuages — Optimal") if cloud_cover >= 40 else (4, f"{moment} lumineux")
+            note_moment, desc_moment = 5, f"{moment} — Transition lumineuse idéale"
         elif moment == "Nuit":
-            note_moment, desc_moment = 4, "Nuit — Chasse côtière active"
+            note_moment, desc_moment = 4, "Nuit — Excellent en été (bordures et abris)"
+        elif cloud_cover >= 60:
+            note_moment, desc_moment = 3, f"Journée nuageuse ({round(cloud_cover)}%)"
         else:
-            note_moment, desc_moment = (3, f"Journée nuageuse ({round(cloud_cover)}%)") if cloud_cover >= 60 else (1, f"Plein soleil ({round(cloud_cover)}% nuages) — Difficile")
+            note_moment, desc_moment = 1, f"Plein soleil en journée — Conditions difficiles"
 
-        # --- 5. Vent & Orientation (15%) ---
-        is_vent_mer = 200 <= wind_dir <= 290
-        if 15 <= wind_speed <= 25 and is_vent_mer: note_vent, desc_vent = 5, f"Vent de secteur Ouest idéal ({round(wind_speed,1)} km/h)"
-        elif 10 <= wind_speed <= 28: note_vent, desc_vent = 4, f"Vent modéré ({round(wind_speed,1)} km/h)"
-        elif wind_speed < 10: note_vent, desc_vent = 2, f"Calme plat ({round(wind_speed,1)} km/h)"
-        else: note_vent, desc_vent = 1, f"Vent excessif ou de terre ({round(wind_speed,1)} km/h)"
-
-        # --- 6. Houle & Température Eau (10%) ---
-        if 0.8 <= wave_height <= 2.0 and 12 <= water_temp <= 19:
-            note_houle, desc_houle = 5, f"Houle idéale ({round(wave_height,1)}m) & Eau à {round(water_temp,1)}°C"
-        elif wave_height < 0.5:
-            note_houle, desc_houle = 2, f"Mer trop calme (Houle : {round(wave_height,1)}m)"
+        # --- 5. Température de l'Eau (10%) ---
+        if 12 <= water_temp <= 20:
+            note_eau, desc_eau = 5, f"Température idéale ({round(water_temp,1)}°C)"
+        elif 7 <= water_temp < 12:
+            note_eau, desc_eau = 3, f"Eau fraîche / limite ({round(water_temp,1)}°C)"
+        elif water_temp < 7:
+            note_eau, desc_eau = 1, f"Eau trop froide ({round(water_temp,1)}°C) — Inactivité"
         else:
-            note_houle, desc_houle = 3, f"Houle correcte ({round(wave_height,1)}m) - Eau {round(water_temp,1)}°C"
+            note_eau, desc_eau = 4, f"Eau chaude ({round(water_temp,1)}°C) — Prévoir profondeur"
+
+        # --- 6. Carnet & Historique (10%) ---
+        note_carnet, desc_carnet = 3, "Historique neutre (En attente de vos saisies)"
 
         # Calcul du score global pondéré exact (Somme des poids = 100%)
         score_total = round(
-            (note_maree / 5 * 25) + 
-            (note_carnet / 5 * 20) + 
-            (note_press / 5 * 15) + 
-            (note_moment / 5 * 15) + 
-            (note_vent / 5 * 15) + 
-            (note_houle / 5 * 10), 1
-        ) * 20  # Passage sur 100
+            (note_maree * 0.25) + 
+            (note_press * 0.20) + 
+            (note_vent * 0.20) + 
+            (note_moment * 0.15) + 
+            (note_eau * 0.10) + 
+            (note_carnet * 0.10), 2
+        ) * 20  # Remise sur 100 (Max 5 * 20 = 100)
 
         records.append({
             "date": date, "moment": moment, "score_total": score_total, "coef": coef,
             "note_maree": note_maree, "desc_maree": desc_maree,
-            "note_carnet": note_carnet, "desc_carnet": desc_carnet,
             "note_press": note_press, "desc_press": desc_press,
-            "note_moment": note_moment, "desc_moment": desc_moment,
             "note_vent": note_vent, "desc_vent": desc_vent,
-            "note_houle": note_houle, "desc_houle": desc_houle,
+            "note_moment": note_moment, "desc_moment": desc_moment,
+            "note_eau": note_eau, "desc_eau": desc_eau,
+            "note_carnet": note_carnet, "desc_carnet": desc_carnet,
         })
 
     df_grouped = pd.DataFrame(records)
@@ -219,23 +226,23 @@ if not df_weather.empty:
         col_c1, col_c2 = st.columns(2)
 
         with col_c1:
-            st.write("#### 🌊 Marée & Courant (25%)")
+            st.write("#### 🌊 Marée & Coefficients (25%)")
             render_score_badge(r["note_maree"], r["desc_maree"])
 
-            st.write("#### 📖 Carnet & Historique (20%)")
-            render_score_badge(r["note_carnet"], r["desc_carnet"])
-
-            st.write("#### 📉 Pression Atmosphérique (15%)")
+            st.write("#### 📉 Pression Atmosphérique (20%)")
             render_score_badge(r["note_press"], r["desc_press"])
 
-            st.write("#### 🌅 Moment du Jour & Nuages (15%)")
-            render_score_badge(r["note_moment"], r["desc_moment"])
-
-            st.write("#### 🌬️ Vent & Orientation (15%)")
+            st.write("#### 🌬️ Vent, Houle & Orientation (20%)")
             render_score_badge(r["note_vent"], r["desc_vent"])
 
-            st.write("#### 〰️ Houle & Température Eau (10%)")
-            render_score_badge(r["note_houle"], r["desc_houle"])
+            st.write("#### 🌅 Moment du Jour & Luminosité (15%)")
+            render_score_badge(r["note_moment"], r["desc_moment"])
+
+            st.write("#### 🌡️ Température de l'Eau (10%)")
+            render_score_badge(r["note_eau"], r["desc_eau"])
+
+            st.write("#### 📖 Carnet & Historique (10%)")
+            render_score_badge(r["note_carnet"], r["desc_carnet"])
 
         with col_c2:
             st.subheader("🌊 Horaires Marée Réelle")
