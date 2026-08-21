@@ -3,12 +3,12 @@ import requests
 import pandas as pd
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 
-st.set_page_config(page_title="Aide à la Décision - Pêche au Bar V3+", layout="wide")
+st.set_page_config(page_title="Aide à la Décision - Pêche au Bar V3.2", layout="wide")
 
-st.title("🎣 Aide à la Décision V3+ — Pêche au Bar & Auto-Apprentissage")
-st.caption("Zone 50km Le Croisic & Côte Sauvage | Algorithme Calibré & Carnet Intelligent")
+st.title("🎣 Aide à la Décision V3.2 — Pêche au Bar & Auto-Apprentissage")
+st.caption("Zone 50km Le Croisic & Côte Sauvage | Algorithme Calibré & Fenêtres de Marée Affinées")
 
 API_KEY_MAREE = "9452804b6f6e7a5204505c36d252ea48"
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
@@ -82,7 +82,7 @@ def fetch_tides_15days(site_slug, start_date, end_date):
             for day in data["data"]:
                 date_key = day.get("date")
                 extrema = day.get("extrema", [])
-                coefs = [e["coef"] for e in extrema if e.get("type") == "PM" and "coef" in e]
+                coefs = [e["coef"] for e in extrema if e.get("type"] == "PM" and "coef" in e]
                 max_coef = max(coefs) if coefs else 70
                 tides_by_date[date_key] = {"max_coef": max_coef, "extrema": extrema}
         return tides_by_date
@@ -136,18 +136,62 @@ if not df_weather.empty:
         wave_height = group["wave_height"].mean() if not group["wave_height"].isna().all() else 1.0
         water_temp = group["sea_surface_temperature"].mean() if not group["sea_surface_temperature"].isna().all() else 15.0
 
-        day_tide = tides_dict.get(date, {"max_coef": 70, "extrema": []})
-        coef = day_tide["max_coef"]
+        # Calcul de la tendance de pression (Delta sur les 6h précédentes si possible)
+        # On regarde la première heure du groupe pour estimer la variation
+        group_sorted = group.sort_values("time")
+        first_time_val = group_sorted["time"].iloc[0]
+        past_weather = df_weather[(df_weather["time"] >= first_time_val - timedelta(hours=6)) & (df_weather["time"] < first_time_val)]
+        if not past_weather.empty:
+            pressure_delta = pressure - past_weather["surface_pressure"].mean()
+        else:
+            pressure_delta = 0.0 # Neutre par défaut
 
-        if coef >= 75: note_maree, desc_maree = 5, f"Excellent coefficient ({coef} >= 75) — Fortes veines de courant"
-        elif coef >= 60: note_maree, desc_maree = 4, f"Bon coefficient ({coef})"
-        elif coef >= 45: note_maree, desc_maree = 3, f"Coefficient moyen ({coef})"
-        else: note_maree, desc_maree = 1, f"Morte-eau stricte ({coef})"
+        day_info = tides_dict.get(date, {"max_coef": 70, "extrema": []})
+        coef = day_info["max_coef"]
+        extrema = day_info.get("extrema", [])
 
-        if pressure < 1010: note_press, desc_press = 5, f"Dépression / Baisse marquée ({round(pressure,1)} hPa)"
-        elif pressure <= 1022: note_press, desc_press = 3, f"Pression stable ({round(pressure,1)} hPa)"
-        else: note_press, desc_press = 2, f"Anticyclone durable ({round(pressure,1)} hPa)"
+        # --- CRÉNEAU HORAIRE MOYEN DU GROUPE ---
+        mean_hour = group["hour"].mean()
+        
+        # Vérification de la fenêtre optimale de Pleine Mer (-2h à +1h)
+        is_near_pm = False
+        pm_info_str = ""
+        for ext in extrema:
+            if ext.get("type") == "PM":
+                try:
+                    pm_time_str = ext.get("time", "").split("T")[-1]
+                    pm_hour = int(pm_time_str.split(":")[0]) + int(pm_time_str.split(":")[1])/60.0
+                    # Fenêtre : [PM - 2h ; PM + 1h]
+                    if (pm_hour - 2.0) <= mean_hour <= (pm_hour + 1.0):
+                        is_near_pm = True
+                        pm_info_str = f" (Idéal : Pleine Mer à {pm_time_str[:5]})"
+                        break
+                except Exception:
+                    pass
 
+        # 1. NOTE MARÉE & COEFFICIENT (avec bonus Pleine Mer)
+        if coef >= 75 and is_near_pm:
+            note_maree, desc_maree = 5, f"Coef {coef} + Pleine Mer imminente/récente{pm_info_str} — Top spot !"
+        elif coef >= 60 and is_near_pm:
+            note_maree, desc_maree = 4, f"Bon coef ({coef}) dans la fenêtre clé PM{pm_info_str}"
+        elif coef >= 75:
+            note_maree, desc_maree = 4, f"Fort coefficient ({coef}) mais hors fenêtre PM optimale"
+        elif coef >= 60:
+            note_maree, desc_maree = 3, f"Coefficient correct ({coef})"
+        else:
+            note_maree, desc_maree = 1, f"Morte-eau stricte ({coef})"
+
+        # 2. NOTE PRESSION (avec bonus si delta à la baisse)
+        if pressure < 1010 or pressure_delta < -1.0:
+            note_press, desc_press = 5, f"Baisse marquée / Dépression ({round(pressure,1)} hPa, Delta: {round(pressure_delta,1)} hPa)"
+        elif pressure <= 1022 and pressure_delta <= -0.3:
+            note_press, desc_press = 4, f"Pression en baisse favorable ({round(pressure,1)} hPa)"
+        elif pressure <= 1022:
+            note_press, desc_press = 3, f"Pression stable ({round(pressure,1)} hPa)"
+        else:
+            note_press, desc_press = 2, f"Anticyclone durable ({round(pressure,1)} hPa)"
+
+        # 3. NOTE VENT & HOULE
         is_vent_favorable = 180 <= wind_dir <= 310
         if 12 <= wind_speed <= 30 and is_vent_favorable and wave_height >= 0.8:
             note_vent, desc_vent = 5, f"Vent Sud/Ouest ({round(wind_speed,1)} km/h) & Houle ({round(wave_height,1)}m)"
@@ -156,6 +200,7 @@ if not df_weather.empty:
         else:
             note_vent, desc_vent = 3, f"Vent modéré ({round(wind_speed,1)} km/h)"
 
+        # 4. NOTE MOMENT
         if moment in ["Aube (Coup du matin)", "Crépuscule (Coup du soir)"]:
             note_moment, desc_moment = 5, f"{moment} — Transition lumineuse idéale"
         elif moment == "Nuit":
@@ -165,6 +210,7 @@ if not df_weather.empty:
         else:
             note_moment, desc_moment = 1, "Plein soleil en journée"
 
+        # 5. NOTE EAU
         if 12 <= water_temp <= 20:
             note_eau, desc_eau = 5, f"Température idéale ({round(water_temp,1)}°C)"
         elif water_temp < 7:
@@ -172,12 +218,14 @@ if not df_weather.empty:
         else:
             note_eau, desc_eau = 3, f"Eau fraîche/limite ({round(water_temp,1)}°C)"
         
+        # 6. NOTE CARNET (IA)
         note_carnet, desc_carnet = 3, "Historique neutre"
         if bonus_historique_actif:
             similar_catches = [c for c in carnet_data if abs(c.get("coef", 70) - coef) <= 10]
             if similar_catches:
                 note_carnet, desc_carnet = 5, f"🔥 Apprentissage IA : {len(similar_catches)} prise(s) sur ce type de coef"
 
+        # Pondérations (Total 100%)
         score_total = round(
             (note_maree * 0.25) + 
             (note_press * 0.20) + 
@@ -216,7 +264,6 @@ if not df_weather.empty:
         st.divider()
         st.header("🔍 Analyse Détaillée de la Journée")
         
-        # UN SEUL MENU DÉROULANT POUR LA DATE COMMUNE
         selected_date = st.selectbox("📅 Sélectionner la date à analyser", df_grouped["date"].unique(), key="sel_date_commun")
 
         st.markdown("### 🌊 Marées du Jour")
@@ -240,7 +287,6 @@ if not df_weather.empty:
         st.markdown("---")
         st.markdown("### ⏰ Détail par Créneau (Aube, Matin, etc.)")
         
-        # Sélecteur de moment pour la date choisie
         selected_moment = st.selectbox("Choisir le créneau horaire", moments_order, key="sel_moment_detail")
 
         row_detail = df_grouped[(df_grouped["date"] == selected_date) & (df_grouped["moment"] == selected_moment)]
