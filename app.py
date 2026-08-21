@@ -30,7 +30,6 @@ MOMENTS_MAP = {
     "Nuit": {"hours": [22, 23, 0, 1, 2, 3, 4]}
 }
 
-# --- GESTION DU CARNET LOCAL ---
 def charger_carnet():
     if os.path.exists(CARNET_FILE):
         try:
@@ -47,7 +46,6 @@ def sauvegarder_carnet(carnet):
 spot_nom = st.sidebar.selectbox("📍 Secteur de pêche par défaut", list(SPOTS.keys()))
 coords = SPOTS[spot_nom]
 
-# Récupération des API
 @st.cache_data(ttl=3600)
 def fetch_weather_16days(lat, lon):
     url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&hourly=temperature_2m,surface_pressure,wind_speed_10m,wind_direction_10m,cloud_cover&forecast_days=16&timezone=auto"
@@ -100,7 +98,6 @@ def render_score_badge(score, text):
         unsafe_allow_html=True
     )
 
-# --- CHARGEMENT DES DONNÉES MÉTÉO ---
 df_weather = fetch_weather_16days(coords["lat"], coords["lon"])
 df_marine = fetch_marine_data(coords["lat"], coords["lon"])
 
@@ -127,9 +124,8 @@ if not df_weather.empty:
     df_weather["moment"] = df_weather["hour"].apply(assign_moment)
     df_filtered = df_weather[df_weather["date"].isin(dates_list)]
 
-    # Calcul dynamique du carnet pour influencer le score (Auto-apprentissage)
     carnet_data = charger_carnet()
-    bonus_historique_actif = len(carnet_data) >= 3  # S'il y a assez de prises enregistrées
+    bonus_historique_actif = len(carnet_data) >= 3
 
     records = []
     for (date, moment), group in df_filtered.groupby(["date", "moment"]):
@@ -143,25 +139,18 @@ if not df_weather.empty:
         day_tide = tides_dict.get(date, {"max_coef": 70, "extrema": []})
         coef = day_tide["max_coef"]
 
-        # Évaluations de base
         note_maree = 5 if coef >= 75 else (4 if coef >= 60 else 3)
         note_press = 5 if pressure < 1010 else (3 if pressure <= 1022 else 2)
         note_vent = 5 if (12 <= wind_speed <= 30 and wave_height >= 0.8) else 3
         note_moment = 5 if moment in ["Aube (Coup du matin)", "Crépuscule (Coup du soir)"] else (4 if moment == "Nuit" else 3)
         note_eau = 5 if (12 <= water_temp <= 20) else 3
         
-        # --- AUTO-APPRENTISSAGE INTELLIGENT ---
-        # Si l'utilisateur a des prises enregistrées dans des conditions similaires (ex: même profil de vent/coef), on booste le carnet !
         note_carnet = 3
-        desc_carnet = "Historique neutre (En attente de saisies)"
         if bonus_historique_actif:
-            # Vérification simple par similarité de coefficient ou vent
             similar_catches = [c for c in carnet_data if abs(c.get("coef", 70) - coef) <= 10]
             if similar_catches:
                 note_carnet = 5
-                desc_carnet = f"🔥 Apprentissage IA : {len(similar_catches)} prise(s) réussie(s) dans des conditions de coef similaires !"
 
-        # Pondérations (Total 100%)
         score_total = round(
             (note_maree * 0.25) + 
             (note_press * 0.20) + 
@@ -175,13 +164,11 @@ if not df_weather.empty:
             "date": date, "moment": moment, "score_total": score_total, "coef": coef,
             "note_maree": note_maree, "note_press": note_press, "note_vent": note_vent,
             "note_moment": note_moment, "note_eau": note_eau, "note_carnet": note_carnet,
-            "desc_carnet": desc_carnet, "wind_speed": wind_speed, "pressure": pressure
         })
 
     df_grouped = pd.DataFrame(records)
     moments_order = ["Aube (Coup du matin)", "Matin (Lumière douce)", "Après-Midi (Plein soleil)", "Crépuscule (Coup du soir)", "Nuit"]
 
-    # --- STRUCTURE EN ONGLETS ---
     tab_grille, tab_carnet, tab_analyse, tab_shom = st.tabs([
         "📊 Grille de Décision (15J)", 
         "📖 Carnet de Prises & Saisie", 
@@ -203,17 +190,16 @@ if not df_weather.empty:
                 date_prise = st.date_input("Date de la sortie", datetime.now())
                 spot_prise = st.selectbox("Spot", list(SPOTS.keys()))
             with col_f2:
-                nb_poissons = st.number_input("Nombre de bars pris", min_val=0, max_val=20, value=1)
-                taille_max = st.number_input("Taille maximale (cm)", min_val=0, max_val=100, value=45)
+                nb_poissons = st.number_input("Nombre de bars pris", min_value=0, max_value=20, value=1)
+                taille_max = st.number_input("Taille maximale (cm)", min_value=0, max_value=100, value=45)
             with col_f3:
                 leurre_utilise = st.text_input("Leurre / Technique principal(e)", "Black Minnow 120")
                 
-            commentaire = st.text_area("Notes sur la session (conditions, vent ressenti, est-ce une anomalie positive ?)")
+            commentaire = st.text_area("Notes sur la session")
             submit_prise = st.form_submit_button("Enregistrer dans le Carnet 🎣")
 
             if submit_prise:
                 date_str = date_prise.strftime("%Y-%m-%d")
-                # Récupération automatique des conditions de ce jour-là si présentes
                 coef_jour = tides_dict.get(date_str, {}).get("max_coef", 70)
                 
                 new_entry = {
@@ -227,7 +213,7 @@ if not df_weather.empty:
                 }
                 carnet_data.append(new_entry)
                 sauvegarder_carnet(carnet_data)
-                st.success("✅ Prise enregistrée avec succès ! L'algorithme intègre ces données.")
+                st.success("✅ Prise enregistrée avec succès !")
 
         st.divider()
         st.subheader("Historique de vos prises enregistrées")
@@ -239,19 +225,17 @@ if not df_weather.empty:
                     os.remove(CARNET_FILE)
                 st.rerun()
         else:
-            st.info("Aucune prise enregistrée pour le moment. Remplissez le formulaire ci-dessus pour nourrir l'intelligence de l'app.")
+            st.info("Aucune prise enregistrée pour le moment.")
 
     with tab_analyse:
         st.header("🧠 Analyse & Auto-Apprentissage de l'Algorithme")
-        st.write("Cette section analyse les corrélations entre vos prises enregistrées et les paramètres météo/marée.")
-        
         if len(carnet_data) >= 3:
             df_c = pd.DataFrame(carnet_data)
             moy_coef = df_c["coef"].mean()
             st.metric("Coefficient moyen de réussite mesuré", f"{round(moy_coef, 1)}")
-            st.success("🤖 L'algorithme a détecté un pattern sur vos coefficients favoris et re-calibre automatiquement le critère 'Carnet & Historique' dans la grille globale.")
+            st.success("🤖 L'algorithme a détecté un pattern sur vos coefficients favoris !")
         else:
-            st.warning("⚠️ Pas assez de données dans le carnet (minimum 3 sessions requises) pour enclencher l'auto-apprentissage dynamique des poids.")
+            st.warning("⚠️ Pas assez de données dans le carnet (minimum 3 sessions requises).")
 
     with tab_shom:
         st.header("Graphique SHOM Officiel")
