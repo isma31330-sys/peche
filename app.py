@@ -5,15 +5,15 @@ import pandas as pd
 st.set_page_config(page_title="Aide à la Décision - Pêche au Bar V3+", layout="wide")
 
 st.title("🎣 Aide à la Décision V3+ — Pêche au Bar")
-st.caption("Zone 50km Le Croisic & Côte Sauvage | Prévisions 15J & Décomposition")
+st.caption("Zone 50km Le Croisic & Côte Sauvage | Prévisions & Algorithme Marée Dynamique")
 
-# 1. Configuration des Spots GPS
+# 1. Cartographie des ports SHOM / API-Marée pour chaque secteur
 SPOTS = {
-    "Côte Sauvage (Le Croisic)": {"lat": 47.2931, "lon": -2.5204},
-    "Pointe du Castelli (Piriac)": {"lat": 47.3781, "lon": -2.5512},
-    "Baie de Mesquer": {"lat": 47.3986, "lon": -2.4635},
-    "Estuaire de la Loire": {"lat": 47.2300, "lon": -2.1800},
-    "Île de Dumet": {"lat": 47.4111, "lon": -2.6208}
+    "Côte Sauvage (Le Croisic)": {"lat": 47.2931, "lon": -2.5204, "port_id": "le-croisic"},
+    "Pointe du Castelli (Piriac)": {"lat": 47.3781, "lon": -2.5512, "port_id": "piriac-sur-mer"},
+    "Baie de Mesquer": {"lat": 47.3986, "lon": -2.4635, "port_id": "penerf"},
+    "Estuaire de la Loire": {"lat": 47.2300, "lon": -2.1800, "port_id": "saint-nazaire"},
+    "Île de Dumet": {"lat": 47.4111, "lon": -2.6208, "port_id": "piriac-sur-mer"}
 }
 
 MOMENTS_MAP = {
@@ -27,43 +27,39 @@ MOMENTS_MAP = {
 spot_nom = st.sidebar.selectbox("📍 Secteur de pêche", list(SPOTS.keys()))
 coords = SPOTS[spot_nom]
 
-# 2. Récupération Marée Gratuite (Open-Meteo Marine)
-@st.cache_data(ttl=3600)
-def fetch_tide_data(lat, lon, target_date):
-    url = f"https://marine-api.open-meteo.com/v1/marine?latitude={lat}&longitude={lon}&hourly=sea_level_height_above_mean_sea_level&forecast_days=16&timezone=auto"
+# 2. Récupération des marées via api-maree.fr
+@st.cache_data(ttl=7200)
+def fetch_tide_info(port_id, target_date):
+    """
+    Interroge l'API publique api-maree.fr pour obtenir les horaires et coefficients exacts.
+    """
+    url = f"https://api-maree.fr/tide-extrema?site={port_id}&from={target_date}&to={target_date}&tz=Europe/Paris"
     try:
-        res = requests.get(url, timeout=5).json()
-        hourly = res.get("hourly", {})
-        if hourly:
-            df_tide = pd.DataFrame(hourly)
-            df_tide["time"] = pd.to_datetime(df_tide["time"])
-            df_day = df_tide[df_tide["time"].dt.strftime("%Y-%m-%d") == target_date].copy()
+        res = requests.get(url, timeout=5)
+        if res.status_code == 200:
+            data = res.json()
+            extrema = data.get("extrema", [])
             
-            if not df_day.empty:
-                heights = df_day["sea_level_height_above_mean_sea_level"].tolist()
+            coefs = []
+            horaires = []
+            
+            for item in extrema:
+                heure = pd.to_datetime(item["date"]).strftime("%H:%M")
+                type_m = "PM" if item["state"] == "high" else "BM"
+                horaires.append(f"{heure} ({type_m})")
                 
-                # Calcul de l'mplitude pour estimer le coefficient
-                amp = max(heights) - min(heights)
-                estimated_coef = min(120, max(20, int(amp * 22 + 20)))
-                
-                # Détection des pics (PM) et creux (BM)
-                extrema = []
-                for i in range(1, len(df_day) - 1):
-                    prev_h = heights[i-1]
-                    curr_h = heights[i]
-                    next_h = heights[i+1]
-                    t_str = df_day.iloc[i]["time"].strftime("%H:%M")
-                    
-                    if curr_h > prev_h and curr_h > next_h:
-                        extrema.append(f"{t_str} (PM)")
-                    elif curr_h < prev_h and curr_h < next_h:
-                        extrema.append(f"{t_str} (BM)")
-                
-                str_horaires = " | ".join(extrema) if extrema else "Données de marée lissées"
-                return estimated_coef, str_horaires
+                if "coef" in item and item["coef"] is not None:
+                    coefs.append(int(item["coef"]))
+            
+            main_coef = max(coefs) if coefs else 60
+            str_horaires = " | ".join(horaires) if horaires else "Horaire non précisé"
+            
+            return main_coef, str_horaires
     except Exception:
         pass
-    return "N/A", "Indisponible"
+    
+    # Valeurs par défaut si le réseau ou l'API ne répond pas
+    return 65, "Non disponible"
 
 # 3. Récupération Météo 16J (Open-Meteo)
 @st.cache_data(ttl=3600)
@@ -103,18 +99,35 @@ if hourly_raw:
         "surface_pressure": "mean"
     }).reset_index()
 
-    # Calcul des scores V3+
+    # 4. Calcul du score intégrant Réellement la Marée
     def calculate_score(row):
-        sub_moment = MOMENTS_MAP.get(row["moment"], 60)
-        sub_maree = 85 if row["moment"] in ["Aube (Coup du matin)", "Crépuscule (Coup du soir)"] else 65
+        # Récupération dynamique du coeff de marée du jour
+        coef_jour, _ = fetch_tide_info(coords["port_id"], row["date"])
         
+        # Algorithme de calcul du sous-score Marée (25% du score final)
+        # Combinaison : Coefficient du jour + adéquation avec la tranche horaire
+        if coef_jour >= 70:
+            coef_factor = 90
+        elif coef_jour >= 50:
+            coef_factor = 70
+        else:
+            coef_factor = 50
+            
+        # Bonus si le créneau tombe sur l'Aube ou le Crépuscule
+        if row["moment"] in ["Aube (Coup du matin)", "Crépuscule (Coup du soir)"]:
+            sub_maree = min(100, coef_factor + 15)
+        else:
+            sub_maree = coef_factor
+
+        # Autres sous-scores
+        sub_moment = MOMENTS_MAP.get(row["moment"], 60)
         is_vent_mer = 200 <= row["wind_direction_10m"] <= 290
         sub_vent = 90 if (12 <= row["wind_speed_10m"] <= 25 and is_vent_mer) else 55
         sub_pression = 85 if row["surface_pressure"] < 1015 else 60
-        
         sub_houle = 75
         sub_carnet = 70
 
+        # PONDÉRATION (100% total)
         c_maree = 0.25 * sub_maree
         c_carnet = 0.20 * sub_carnet
         c_pression = 0.15 * sub_pression
@@ -137,22 +150,19 @@ if hourly_raw:
     ]
     df_grouped[score_cols] = df_grouped.apply(calculate_score, axis=1)
 
-    # 4. Grille des Prévisions (Matrice)
-    st.header("1. Grille des Prévisions sur 15 Jours (Par Créneau)")
+    # 5. Affichage Grille
+    st.header("1. Grille des Prévisions sur 15 Jours")
     moments_order = ["Aube (Coup du matin)", "Matin (Lumière douce)", "Après-Midi (Plein soleil)", "Crépuscule (Coup du soir)", "Nuit"]
     matrix_df = df_grouped.pivot(index="date", columns="moment", values="score_total")
     matrix_df = matrix_df.reindex(columns=[m for m in moments_order if m in matrix_df.columns])
 
-    try:
-        st.dataframe(
-            matrix_df.style.background_gradient(cmap="RdYlGn", vmin=40, vmax=90).format("{:.1f}"),
-            use_container_width=True,
-            height=400
-        )
-    except Exception:
-        st.dataframe(matrix_df, use_container_width=True, height=400)
+    st.dataframe(
+        matrix_df.style.background_gradient(cmap="RdYlGn", vmin=40, vmax=90).format("{:.1f}"),
+        use_container_width=True,
+        height=400
+    )
 
-    # 5. Inspection Détaillée + Marée
+    # 6. Vue Détaillée
     st.divider()
     st.header("2. Analyse Détaillée du Créneau & Marée")
     
@@ -162,14 +172,13 @@ if hourly_raw:
     with col_sel2:
         selected_moment = st.selectbox("Sélectionner le créneau", moments_order)
 
-    # Récupération dynamique de la marée pour la date SÉLECTIONNÉE
-    coef_maree, horaires_maree = fetch_tide_data(coords["lat"], coords["lon"], selected_date)
+    # Appel direct pour l'affichage de la carte d'information
+    coef_actuel, etales_actuelles = fetch_tide_info(coords["port_id"], selected_date)
 
     row_detail = df_grouped[(df_grouped["date"] == selected_date) & (df_grouped["moment"] == selected_moment)]
 
     if not row_detail.empty:
         r = row_detail.iloc[0]
-        
         col_res1, col_res2 = st.columns([1, 2])
         
         with col_res1:
@@ -178,26 +187,18 @@ if hourly_raw:
                 value=f"{r['score_total']} / 100"
             )
 
-            st.markdown("### 🌊 Informations Marée")
-            st.info(f"**Coeff. estimé** : {coef_maree}\n\n**Étales (BM/PM)** : {horaires_maree}")
+            st.markdown("### 🌊 Informations Marée (Pondération 25%)")
+            st.info(f"**Coeff. SHOM** : {coef_actuel}\n\n**Étales du jour** : {etales_actuelles}")
 
             st.markdown("### 🍃 Conditions Météo")
             st.write(f"**Vent moyen** : {round(r['wind_speed_10m'], 1)} km/h ({round(r['wind_direction_10m'])}°)")
             st.write(f"**Pression** : {round(r['surface_pressure'], 1)} hPa")
 
-            if "Aube" in selected_moment or "Crépuscule" in selected_moment:
-                st.success("💡 **Stratégie** : Leurres de surface & sub-surface (chasses de bordure).")
-            elif "Nuit" in selected_moment:
-                st.info("💡 **Stratégie** : Pêche lente au leurre dur / souple près des berges.")
-            else:
-                st.warning("💡 **Stratégie** : Pêche creuse (cassants, sous-bois d'algues) au leurre souple.")
-
         with col_res2:
-            st.subheader("📊 Décomposition des points apportés au score")
-            
+            st.subheader("📊 Décomposition de la note")
             df_decomp = pd.DataFrame({
                 "Critère": [
-                    "Marée & Courant (25%)", 
+                    "Marée & Coeff (25%)", 
                     "Carnet & Historique (20%)", 
                     "Pression Atm. (15%)", 
                     "Moment du Jour (15%)", 
@@ -217,8 +218,8 @@ if hourly_raw:
             st.bar_chart(df_decomp["Points apportés"])
             st.table(df_decomp)
 
-# 6. Océanogramme SHOM
+# 7. Widget SHOM
 st.divider()
-st.header("3. Océanogramme SHOM (Marée & Hauteur d'eau exactes)")
+st.header("3. Océanogramme SHOM (Graphique en Direct)")
 shom_url = f"https://services.data.shom.fr/oceano/render/html/widget?duration=4&delta-date=0&lon={coords['lon']}&lat={coords['lat']}&utc=1&lang=fr"
 st.components.v1.iframe(shom_url, height=550, scrolling=True)
