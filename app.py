@@ -30,41 +30,35 @@ coords = SPOTS[spot_nom]
 
 # Récupération stricte sans aucune donnée générée en cas de panne
 def fetch_strict_data(lat, lon):
-    url_marine = f"https://marine-api.open-meteo.com/v1/marine?latitude={lat}&longitude={lon}&hourly=sea_level_height_above_mean_sea_level&forecast_days=7&timezone=auto"
-    url_weather = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&hourly=temperature_2m,surface_pressure,wind_speed_10m,wind_direction_10m&forecast_days=7&timezone=auto"
+    # API Météo & Marée unifiée avec le bon nom de paramètre
+    url_weather = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&hourly=temperature_2m,surface_pressure,wind_speed_10m,wind_direction_10m,sea_level_height&forecast_days=7&timezone=auto"
     
     try:
-        res_m = requests.get(url_marine, headers=HEADERS, timeout=10)
         res_w = requests.get(url_weather, headers=HEADERS, timeout=10)
         
-        # Vérification stricte des codes HTTP
-        if res_m.status_code != 200:
-            st.error(f"❌ Échec de l'API Marée (Code {res_m.status_code}) : {res_m.text}")
-            return pd.DataFrame()
         if res_w.status_code != 200:
-            st.error(f"❌ Échec de l'API Météo (Code {res_w.status_code}) : {res_w.text}")
+            st.error(f"❌ Échec de l'API (Code {res_w.status_code}) : {res_w.text}")
             return pd.DataFrame()
 
-        data_m = res_m.json()
         data_w = res_w.json()
 
-        if "hourly" not in data_m or "sea_level_height_above_mean_sea_level" not in data_m["hourly"]:
-            st.error("❌ Les données de hauteur d'eau de marée sont absentes de la réponse de l'API Marine.")
+        if "hourly" not in data_w or "sea_level_height" not in data_w["hourly"]:
+            st.error("❌ La variable 'sea_level_height' est introuvable dans la réponse API.")
             return pd.DataFrame()
 
-        df_m = pd.DataFrame(data_m["hourly"])
         df_w = pd.DataFrame(data_w["hourly"])
-
-        df_m["time"] = pd.to_datetime(df_m["time"])
         df_w["time"] = pd.to_datetime(df_w["time"])
+        
+        # Renommage explicite pour correspondre au reste du script
+        df_w["sea_level_height_above_mean_sea_level"] = df_w["sea_level_height"]
 
-        return pd.merge(df_w, df_m, on="time")
+        return df_w
 
     except requests.exceptions.RequestException as e:
         st.error(f"❌ Erreur réseau lors de la requête API : {e}")
         return pd.DataFrame()
     except Exception as e:
-        st.error(f"❌ Erreur imprévue lors du traitement des données : {e}")
+        st.error(f"❌ Erreur imprévue lors du traitement : {e}")
         return pd.DataFrame()
 
 df = fetch_strict_data(coords["lat"], coords["lon"])
