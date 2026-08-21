@@ -24,37 +24,39 @@ MOMENTS_MAP = {
     "Nuit": 78
 }
 
-MAREE_API_KEY = st.secrets.get("MAREE_API_KEY", "VOTRE_CLE_API_MAREE")
-
-# 1. Sélection du spot
-spot_nom = st.sidebar.selectbox("📍 Secteur de pêche", list(SPOTS.keys()))
-coords = SPOTS[spot_nom]
-
-# 2. Fonction d'appel API Marée dynamisée par DATE
+# 2. Fonction d'appel API Marée corrigée
 @st.cache_data(ttl=3600)
 def fetch_tide_info(port_id, target_date, api_key):
     """
-    Interroge l'API pour la date exacte (YYYY-MM-DD)
+    Interroge l'API pour la date exacte (YYYY-MM-DD) avec gestion d'erreurs
     """
+    # Si la clé n'est pas renseignée dans secrets.toml
+    if not api_key or api_key == "VOTRE_CLE_API_MAREE":
+        return "N/A", "Clé MAREE_API_KEY non configurée dans Streamlit Secrets"
+
     url = f"https://api-maree.fr/tide-extrema?key={api_key}&site={port_id}&from={target_date}&to={target_date}"
     try:
-        res = requests.get(url, timeout=5).json()
-        if res.get("status") == "success" and target_date in res.get("data", {}):
-            day_data = res["data"][target_date]
-            coef = day_data.get("coefficient", "N/A")
-            
-            extrema = day_data.get("extrema", [])
-            horaires_list = []
-            for e in extrema:
-                heure = e.get("time")
-                type_m = "PM" if e.get("state") == "HIGH TIDE" else "BM"
-                horaires_list.append(f"{heure} ({type_m})")
-            
-            str_horaires = " | ".join(horaires_list)
-            return coef, str_horaires
-    except Exception:
+        response = requests.get(url, timeout=5)
+        if response.status_code == 200:
+            res = response.json()
+            if res.get("status") == "success" and target_date in res.get("data", {}):
+                day_data = res["data"][target_date]
+                coef = day_data.get("coefficient", "N/A")
+                
+                extrema = day_data.get("extrema", [])
+                horaires_list = [
+                    f"{e.get('time')} ({'PM' if e.get('state') == 'HIGH TIDE' else 'BM'})"
+                    for e in extrema if e.get("time")
+                ]
+                
+                str_horaires = " | ".join(horaires_list) if horaires_list else "Horaires indisponibles"
+                return coef, str_horaires
+        elif response.status_code in [401, 403]:
+            return "N/A", "Clé API invalide ou expirée"
+    except Exception as e:
         pass
-    return "N/A", "Données marée indisponibles (Vérifier clé API)"
+
+    return "N/A", "Erreur de connexion à l'API Marée"
 
 # 3. Récupération Météo 16J (Open-Meteo)
 @st.cache_data(ttl=3600)
