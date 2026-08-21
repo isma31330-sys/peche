@@ -7,11 +7,12 @@ from datetime import datetime, timedelta
 import math
 from streamlit_folium import st_folium
 import folium
+from streamlit_geolocation import streamlit_geolocation
 
-st.set_page_config(page_title="Aide à la Décision - Pêche au Bar V4.2", layout="wide")
+st.set_page_config(page_title="Aide à la Décision - Pêche au Bar V4.3", layout="wide")
 
-st.title("🎣 Aide à la Décision V4.2 — Pêche au Bar & Stations Dynamiques")
-st.caption("Géolocalisation dynamique, couplage Météo/Marées & Carte des prises")
+st.title("🎣 Aide à la Décision V4.3 — Pêche au Bar & GPS Téléphone")
+st.caption("Géolocalisation dynamique, GPS du téléphone, couplage Météo/Marées & Carte des prises")
 
 API_KEY_MAREE = "9452804b6f6e7a5204505c36d252ea48"
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
@@ -92,17 +93,34 @@ def trouver_station_la_plus_proche(lat, lon, liste_sites):
             plus_proche = station
     return plus_proche
 
-# --- SÉLECTION DE LA ZONE SUR CARTE DANS LA SIDEBAR ---
+# --- SÉLECTION DE LA ZONE DANS LA SIDEBAR ---
 st.sidebar.header("🗺️ Sélection de la Zone")
-mode_selection = st.sidebar.radio("Méthode de ciblage", ["Carte interactive cliquable", "Recherche par nom de port"])
+mode_selection = st.sidebar.radio("Méthode de ciblage", [
+    "Carte interactive cliquable", 
+    "Recherche par nom de port", 
+    "📍 GPS du téléphone (Navigateur)"
+])
 
-if mode_selection == "Recherche par nom de port":
+lat_cible, lon_cible = 47.2931, -2.5204 # Valeur par défaut
+
+if mode_selection == "📍 GPS du téléphone (Navigateur)":
+    st.sidebar.info("Clique sur le bouton ci-dessous pour autoriser la lecture de ta position GPS.")
+    loc = streamlit_geolocation()
+    if loc and loc.get("latitude") and loc.get("longitude"):
+        lat_cible = loc["latitude"]
+        lon_cible = loc["longitude"]
+        st.sidebar.success(f"Position GPS capturée !\nLat: {round(lat_cible, 4)}, Lon: {round(lon_cible, 4)}")
+    else:
+        st.sidebar.warning("En attente de l'activation GPS (clique sur le bouton du widget)...")
+
+elif mode_selection == "Recherche par nom de port":
     noms_tires = sorted([s["nom"] for s in REFERENCE_SITES])
     choix_defaut = st.sidebar.selectbox("Secteur / Port", noms_tires)
     station_active = next(s for s in REFERENCE_SITES if s["nom"] == choix_defaut)
     lat_cible, lon_cible = station_active["lat"], station_active["lon"]
-else:
-    st.sidebar.info("Cliquez sur la carte ci-dessous pour définir votre zone de pêche.")
+
+else: # Carte interactive cliquable
+    st.sidebar.info("Clique sur la carte ci-dessous pour définir votre zone de pêche.")
     m_sel = folium.Map(location=[47.3, -2.5], zoom_start=10)
     m_sel.add_child(folium.LatLngPopup())
     map_data = st_folium(m_sel, height=250, width="100%", key="map_selector")
@@ -111,10 +129,8 @@ else:
         lat_cible = map_data["last_clicked"]["lat"]
         lon_cible = map_data["last_clicked"]["lng"]
         st.sidebar.success(f"Position choisie : {round(lat_cible, 4)}, {round(lon_cible, 4)}")
-    else:
-        lat_cible, lon_cible = 47.2931, -2.5204
 
-# Recherche automatique du port de marée le plus proche
+# Recherche automatique du port de marée le plus proche en fonction des coordonnées actives
 station_proche = trouver_station_la_plus_proche(lat_cible, lon_cible, REFERENCE_SITES)
 
 st.sidebar.divider()
