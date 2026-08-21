@@ -4,23 +4,29 @@ import pandas as pd
 import json
 import os
 from datetime import datetime, timedelta
+import math
+from streamlit_folium import st_folium
+import folium
 
-st.set_page_config(page_title="Aide à la Décision - Pêche au Bar V3.2", layout="wide")
+st.set_page_config(page_title="Aide à la Décision - Pêche au Bar V4.0", layout="wide")
 
-st.title("🎣 Aide à la Décision V3.2 — Pêche au Bar & Auto-Apprentissage")
-st.caption("Zone 50km Le Croisic & Côte Sauvage | Algorithme Calibré & Fenêtres de Marée Affinées")
+st.title("🎣 Aide à la Décision V4.0 — Pêche au Bar & Cartographie Intelligente")
+st.caption("Géolocalisation dynamique, plus proches voisins météo/marées & Carte des prises")
 
 API_KEY_MAREE = "9452804b6f6e7a5204505c36d252ea48"
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 CARNET_FILE = "carnet_peche.json"
 
-SPOTS = {
-    "Côte Sauvage (Le Croisic)": {"lat": 47.2931, "lon": -2.5204, "site": "le-croisic"},
-    "Pointe du Castelli (Piriac)": {"lat": 47.3781, "lon": -2.5512, "site": "piriac-sur-mer"},
-    "Baie de Mesquer": {"lat": 47.3986, "lon": -2.4635, "site": "piriac-sur-mer"},
-    "Estuaire de la Loire": {"lat": 47.2300, "lon": -2.1800, "site": "saint-nazaire"},
-    "Île de Dumet": {"lat": 47.4111, "lon": -2.6208, "site": "piriac-sur-mer"}
-}
+# Référentiel étendu de stations météo / marées connues pour le calcul du plus proche voisin
+REFERENCE_SITES = [
+    {"nom": "Côte Sauvage (Le Croisic)", "lat": 47.2931, "lon": -2.5204, "site_maree": "le-croisic"},
+    {"nom": "Pointe du Castelli (Piriac)", "lat": 47.3781, "lon": -2.5512, "site_maree": "piriac-sur-mer"},
+    {"nom": "Baie de Mesquer", "lat": 47.3986, "lon": -2.4635, "site_maree": "piriac-sur-mer"},
+    {"nom": "Estuaire de la Loire (St-Nazaire)", "lat": 47.2300, "lon": -2.1800, "site_maree": "saint-nazaire"},
+    {"nom": "Île de Dumet", "lat": 47.4111, "lon": -2.6208, "site_maree": "piriac-sur-mer"},
+    {"nom": "Pornichet / Baie de La Baule", "lat": 47.2625, "lon": -2.3361, "site_maree": "pornichet"},
+    {"nom": "Le Pouliguen", "lat": 47.2764, "lon": -2.4278, "site_maree": "le-pouliguen"}
+]
 
 MOMENTS_MAP = {
     "Aube (Coup du matin)": {"hours": range(5, 8)},
@@ -43,8 +49,52 @@ def sauvegarder_carnet(carnet):
     with open(CARNET_FILE, "w", encoding="utf-8") as f:
         json.dump(carnet, f, ensure_ascii=False, indent=4)
 
-spot_nom = st.sidebar.selectbox("📍 Secteur de pêche par défaut", list(SPOTS.keys()))
-coords = SPOTS[spot_nom]
+defhaversine(lat1, lon1, lat2, lon2):
+    """Calcule la distance en km entre deux points GPS (Formule de Haversine)"""
+    R = 6371.0
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    a = math.sin(dlat / 2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon / 2)**2
+    c = 2 * math.asin(math.sqrt(a))
+    return R * c
+
+def trouver_station_la_plus_proche(lat, lon):
+    plus_proche = REFERENCE_SITES[0]
+    min_dist = float('inf')
+    for station in REFERENCE_SITES:
+        dist = haversine(lat, lon, station["lat"], station["lon"])
+        if dist < min_dist:
+            min_dist = dist
+            plus_proche = station
+    return plus_proche
+
+# --- SÉLECTION DE LA ZONE SUR CARTE DANS LA SIDEBAR ---
+st.sidebar.header("🗺️ Sélection de la Zone")
+mode_selection = st.sidebar.radio("Méthode de ciblage", ["Carte interactive cliquable", "Sélection rapide par liste"])
+
+if mode_selection == "Sélection rapide par liste":
+    choix_defaut = st.sidebar.selectbox("Secteur", [s["nom"] for s in REFERENCE_SITES])
+    station_active = next(s for s in REFERENCE_SITES if s["nom"] == choix_defaut)
+    lat_cible, lon_cible = station_active["lat"], station_active["lon"]
+else:
+    st.sidebar.info("Cliquez sur la carte ci-dessous pour définir votre zone de pêche.")
+    # Carte miniature de sélection
+    m_sel = folium.Map(location=[47.3, -2.5], zoom_start=10)
+    m_sel.add_child(folium.LatLngPopup())
+    map_data = st_folium(m_sel, height=250, width="100%", key="map_selector")
+    
+    if map_data and map_data.get("last_clicked"):
+        lat_cible = map_data["last_clicked"]["lat"]
+        lon_cible = map_data["last_clicked"]["lng"]
+        st.sidebar.success(f"Position choisie : {round(lat_cible, 4)}, {round(lon_cible, 4)}")
+    else:
+        # Valeur par défaut Le Croisic
+        lat_cible, lon_cible = 47.2931, -2.5204
+
+# Recherche automatique des stations météo et marée les plus proches
+station_proche = trouver_station_la_plus_proche(lat_cible, lon_cible)
+st.sidebar.markdown(f"**Station Météo rattachée :** {station_proche['nom']}")
+st.sidebar.markdown(f"**Site de Marée rattaché :** `{station_proche['site_maree']}`")
 
 @st.cache_data(ttl=3600)
 def fetch_weather_16days(lat, lon):
@@ -98,8 +148,8 @@ def render_score_badge(score, text):
         unsafe_allow_html=True
     )
 
-df_weather = fetch_weather_16days(coords["lat"], coords["lon"])
-df_marine = fetch_marine_data(coords["lat"], coords["lon"])
+df_weather = fetch_weather_16days(lat_cible, lon_cible)
+df_marine = fetch_marine_data(lat_cible, lon_cible)
 
 if not df_weather.empty:
     df_weather["date"] = df_weather["time"].dt.strftime("%Y-%m-%d")
@@ -113,7 +163,7 @@ if not df_weather.empty:
 
     dates_list = sorted(df_weather["date"].unique())[:15]
     start_date, end_date = dates_list[0], dates_list[-1]
-    tides_dict = fetch_tides_15days(coords["site"], start_date, end_date)
+    tides_dict = fetch_tides_15days(station_proche["site_maree"], start_date, end_date)
 
     def assign_moment(hour):
         for name, cfg in MOMENTS_MAP.items():
@@ -165,18 +215,18 @@ if not df_weather.empty:
                     pass
 
         if coef >= 75 and is_near_pm:
-            note_maree, desc_maree = 5, f"Coef {coef} + Pleine Mer imminente/récente{pm_info_str} — Top spot !"
+            note_maree, desc_maree = 5, f"Coef {coef} + Pleine Mer imminente/récente{pm_info_str}"
         elif coef >= 60 and is_near_pm:
             note_maree, desc_maree = 4, f"Bon coef ({coef}) dans la fenêtre clé PM{pm_info_str}"
         elif coef >= 75:
-            note_maree, desc_maree = 4, f"Fort coefficient ({coef}) mais hors fenêtre PM optimale"
+            note_maree, desc_maree = 4, f"Fort coefficient ({coef}) hors fenêtre PM"
         elif coef >= 60:
             note_maree, desc_maree = 3, f"Coefficient correct ({coef})"
         else:
             note_maree, desc_maree = 1, f"Morte-eau stricte ({coef})"
 
         if pressure < 1010 or pressure_delta < -1.0:
-            note_press, desc_press = 5, f"Baisse marquée / Dépression ({round(pressure,1)} hPa, Delta: {round(pressure_delta,1)} hPa)"
+            note_press, desc_press = 5, f"Dépression / Baisse marquée ({round(pressure,1)} hPa, Δ: {round(pressure_delta,1)})"
         elif pressure <= 1022 and pressure_delta <= -0.3:
             note_press, desc_press = 4, f"Pression en baisse favorable ({round(pressure,1)} hPa)"
         elif pressure <= 1022:
@@ -186,20 +236,20 @@ if not df_weather.empty:
 
         is_vent_favorable = 180 <= wind_dir <= 310
         if 12 <= wind_speed <= 30 and is_vent_favorable and wave_height >= 0.8:
-            note_vent, desc_vent = 5, f"Vent Sud/Ouest ({round(wind_speed,1)} km/h) & Houle ({round(wave_height,1)}m)"
+            note_vent, desc_vent = 5, f"Vent SO ({round(wind_speed,1)} km/h) & Houle ({round(wave_height,1)}m)"
         elif wind_speed < 8:
-            note_vent, desc_vent = 1, f"Calme plat total ({round(wind_speed,1)} km/h)"
+            note_vent, desc_vent = 1, f"Calme plat ({round(wind_speed,1)} km/h)"
         else:
             note_vent, desc_vent = 3, f"Vent modéré ({round(wind_speed,1)} km/h)"
 
         if moment in ["Aube (Coup du matin)", "Crépuscule (Coup du soir)"]:
-            note_moment, desc_moment = 5, f"{moment} — Transition lumineuse idéale"
+            note_moment, desc_moment = 5, f"{moment} — Transition lumineuse"
         elif moment == "Nuit":
-            note_moment, desc_moment = 4, "Nuit — Excellent en été (bordures)"
+            note_moment, desc_moment = 4, "Nuit — Excellent en été"
         elif cloud_cover >= 60:
-            note_moment, desc_moment = 3, f"Journée nuageuse ({round(cloud_cover)}%)"
+            note_moment, desc_moment = 3, f"Nuageux ({round(cloud_cover)}%)"
         else:
-            note_moment, desc_moment = 1, "Plein soleil en journée"
+            note_moment, desc_moment = 1, "Plein soleil"
 
         if 12 <= water_temp <= 20:
             note_eau, desc_eau = 5, f"Température idéale ({round(water_temp,1)}°C)"
@@ -212,7 +262,7 @@ if not df_weather.empty:
         if bonus_historique_actif:
             similar_catches = [c for c in carnet_data if abs(c.get("coef", 70) - coef) <= 10]
             if similar_catches:
-                note_carnet, desc_carnet = 5, f"🔥 Apprentissage IA : {len(similar_catches)} prise(s) sur ce type de coef"
+                note_carnet, desc_carnet = 5, f"🔥 IA : {len(similar_catches)} prise(s) sur ce type de coef"
 
         score_total = round(
             (note_maree * 0.25) + 
@@ -238,13 +288,13 @@ if not df_weather.empty:
 
     tab_grille, tab_carnet, tab_analyse, tab_shom = st.tabs([
         "📊 Grille & Vue Détaillée", 
-        "📖 Carnet de Prises & Saisie", 
+        "📖 Carnet, GPS & Carte des Prises", 
         "🧠 Auto-Apprentissage & Stats", 
         "🌊 Widget SHOM"
     ])
 
     with tab_grille:
-        st.header("Grille Globale des Conditions (15 Jours)")
+        st.header(f"Grille Globale ({station_proche['nom']})")
         matrix_df = df_grouped.pivot(index="date", columns="moment", values="score_total")
         matrix_df = matrix_df.reindex(columns=[m for m in moments_order if m in matrix_df.columns])
         st.dataframe(matrix_df.style.background_gradient(cmap="RdYlGn", vmin=40, vmax=90).format("{:.1f}"), use_container_width=True, height=400)
@@ -273,8 +323,7 @@ if not df_weather.empty:
             st.info("Données de marées non disponibles pour cette date.")
 
         st.markdown("---")
-        st.markdown("### ⏰ Détail par Créneau (Aube, Matin, etc.)")
-        
+        st.markdown("### ⏰ Détail par Créneau")
         selected_moment = st.selectbox("Choisir le créneau horaire", moments_order, key="sel_moment_detail")
 
         row_detail = df_grouped[(df_grouped["date"] == selected_date) & (df_grouped["moment"] == selected_moment)]
@@ -287,40 +336,60 @@ if not df_weather.empty:
             with col_d1:
                 st.write("#### 🌊 Marée & Coefficients (25%)")
                 render_score_badge(r["note_maree"], r["desc_maree"])
-
                 st.write("#### 📉 Pression Atmosphérique (20%)")
                 render_score_badge(r["note_press"], r["desc_press"])
-
                 st.write("#### 🌬️ Vent, Houle & Orientation (20%)")
                 render_score_badge(r["note_vent"], r["desc_vent"])
-
             with col_d2:
-                st.write("#### 🌅 Moment du Jour & Luminosité (15%)")
+                st.write("#### 🌅 Moment du Jour (15%)")
                 render_score_badge(r["note_moment"], r["desc_moment"])
-
                 st.write("#### 🌡️ Température de l'Eau (10%)")
                 render_score_badge(r["note_eau"], r["desc_eau"])
-
                 st.write("#### 📖 Carnet & Historique (10%)")
                 render_score_badge(r["note_carnet"], r["desc_carnet"])
         else:
             st.info("Aucune donnée disponible pour ce créneau précis.")
 
     with tab_carnet:
-        st.header("📖 Enregistrer une Session ou une Prise")
+        st.header("📖 Enregistrer une Prise avec Localisation GPS")
+        st.info("Astuce : Clique sur la carte ci-dessous pour positionner précisément le lieu exact de ta prise, ou utilise tes coordonnées GPS actuelles.")
+
+        # Carte interactive pour récupérer les coordonnées de la prise
+        m_prise = folium.Map(location=[lat_cible, lon_cible], zoom_start=12)
+        m_prise.add_child(folium.LatLngPopup())
+        
+        # Affichage des anciennes prises sur la carte si elles ont des coordonnées
+        for c in carnet_data:
+            if "lat" in c and "lon" in c:
+                folium.Marker(
+                    [c["lat"], c["lon"]],
+                    popup=f"<b>{c['nb_poissons']} bar(s)</b><br>Taille max: {c['taille_max']}cm<br>Leurre: {c['leurre']}<br>Date: {c['date']}",
+                    icon=folium.Icon(color="green", icon="fish", prefix="fa")
+                ).add_to(m_prise)
+
+        map_prise_data = st_folium(m_prise, height=350, width="100%", key="map_prise_click")
+
+        # Récupération du clic sur la carte pour pré-remplir le formulaire
+        default_lat = lat_cible
+        default_lon = lon_cible
+        if map_prise_data and map_prise_data.get("last_clicked"):
+            default_lat = map_prise_data["last_clicked"]["lat"]
+            default_lon = map_prise_data["last_clicked"]["lng"]
+
         with st.form("form_carnet"):
             col_f1, col_f2, col_f3 = st.columns(3)
             with col_f1:
                 date_prise = st.date_input("Date de la sortie", datetime.now())
-                spot_prise = st.selectbox("Spot", list(SPOTS.keys()))
+                lat_saisi = st.number_input("Latitude", value=float(default_lat), format="%.5f")
             with col_f2:
                 nb_poissons = st.number_input("Nombre de bars pris", min_value=0, max_value=20, value=1)
-                taille_max = st.number_input("Taille maximale (cm)", min_value=0, max_value=100, value=45)
+                lon_saisi = st.number_input("Longitude", value=float(default_lon), format="%.5f")
             with col_f3:
-                leurre_utilise = st.text_input("Leurre / Technique principal(e)", "Black Minnow 120")
+                taille_max = st.number_input("Taille maximale (cm)", min_value=0, max_value=100, value=45)
+                leurre_utilise = st.text_input("Leurre / Technique", "Black Minnow 120")
                 
-            commentaire = st.text_area("Notes sur la session")
-            submit_prise = st.form_submit_button("Enregistrer dans le Carnet 🎣")
+            commentaire = st.text_area("Notes sur la session (postes, conditions...)")
+            submit_prise = st.form_submit_button("Enregistrer la prise avec GPS 🎣")
 
             if submit_prise:
                 date_str = date_prise.strftime("%Y-%m-%d")
@@ -328,7 +397,8 @@ if not df_weather.empty:
                 
                 new_entry = {
                     "date": date_str,
-                    "spot": spot_prise,
+                    "lat": lat_saisi,
+                    "lon": lon_saisi,
                     "nb_poissons": nb_poissons,
                     "taille_max": taille_max,
                     "leurre": leurre_utilise,
@@ -337,10 +407,10 @@ if not df_weather.empty:
                 }
                 carnet_data.append(new_entry)
                 sauvegarder_carnet(carnet_data)
-                st.success("✅ Prise enregistrée avec succès !")
+                st.success("✅ Prise enregistrée et géolocalisée avec succès ! (Actualise pour voir le marqueur sur la carte)")
 
         st.divider()
-        st.subheader("Historique de vos prises enregistrées")
+        st.subheader("📋 Historique tabulaire des prises")
         if carnet_data:
             df_carnet = pd.DataFrame(carnet_data)
             st.dataframe(df_carnet, use_container_width=True)
@@ -363,5 +433,5 @@ if not df_weather.empty:
 
     with tab_shom:
         st.header("Graphique SHOM Officiel")
-        shom_url = f"https://services.data.shom.fr/oceano/render/html/widget?duration=4&delta-date=0&lon={coords['lon']}&lat={coords['lat']}&utc=1&lang=fr"
+        shom_url = f"https://services.data.shom.fr/oceano/render/html/widget?duration=4&delta-date=0&lon={lon_cible}&lat={lat_cible}&utc=1&lang=fr"
         st.components.v1.iframe(shom_url, height=500, scrolling=True)
