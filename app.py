@@ -46,7 +46,8 @@ def fetch_weather(lat, lon):
 
 # 2. Interrogation stricte d'api-maree.fr
 def fetch_api_maree(lat, lon, date_str):
-    url = f"https://api-maree.fr/api/v1/tide?token={API_KEY_MAREE}&lat={lat}&lng={lon}&date={date_str}"
+    # Endpoint officiel d'api-maree.fr pour interroger les données par coordonnées/date
+    url = f"https://api-maree.fr/ep?key={API_KEY_MAREE}&lat={lat}&lng={lon}&date={date_str}"
     
     try:
         res = requests.get(url, headers=HEADERS, timeout=10)
@@ -56,11 +57,6 @@ def fetch_api_maree(lat, lon, date_str):
             return None
             
         data = res.json()
-        
-        if "error" in data:
-            st.error(f"❌ Erreur renvoyée par api-maree.fr : {data['error']}")
-            return None
-            
         return data
 
     except requests.exceptions.RequestException as e:
