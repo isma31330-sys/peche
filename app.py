@@ -1,126 +1,185 @@
 import streamlit as st
 import requests
 import pandas as pd
+import numpy as np
 
 st.set_page_config(page_title="Aide à la Décision - Pêche au Bar V3+", layout="wide")
 
 st.title("🎣 Aide à la Décision V3+ — Pêche au Bar")
-st.caption("Zone 50km Le Croisic & Côte Sauvage | Décomposition du Score & Variables Temporelles")
+st.caption("Zone 50km Le Croisic & Côte Sauvage | Prévisions Horaire 15J & Décomposition")
 
-# Spots GPS & ID Ports
+# Spots GPS
 SPOTS = {
-    "Côte Sauvage (Le Croisic)": {"lat": 47.2931, "lon": -2.5204, "port_id": "80"},
-    "Pointe du Castelli (Piriac)": {"lat": 47.3781, "lon": -2.5512, "port_id": "80"},
-    "Baie de Mesquer": {"lat": 47.3986, "lon": -2.4635, "port_id": "80"},
-    "Estuaire de la Loire": {"lat": 47.2300, "lon": -2.1800, "port_id": "82"},
-    "Île de Dumet": {"lat": 47.4111, "lon": -2.6208, "port_id": "80"}
+    "Côte Sauvage (Le Croisic)": {"lat": 47.2931, "lon": -2.5204},
+    "Pointe du Castelli (Piriac)": {"lat": 47.3781, "lon": -2.5512},
+    "Baie de Mesquer": {"lat": 47.3986, "lon": -2.4635},
+    "Estuaire de la Loire": {"lat": 47.2300, "lon": -2.1800},
+    "Île de Dumet": {"lat": 47.4111, "lon": -2.6208}
 }
 
-MAREE_API_KEY = st.secrets.get("MAREE_API_KEY", "VOTRE_CLE_API_MAREE")
-
-# 1. Sélection de la zone et de l'heure/marée
-st.header("1. Paramètres de la Session")
-col_s1, col_s2, col_s3 = st.columns(3)
-
-with col_s1:
-    spot_nom = st.selectbox("Secteur de pêche", list(SPOTS.keys()))
-    coords = SPOTS[spot_nom]
-
-with col_s2:
-    moment = st.selectbox(
-        "Moment du jour",
-        ["Aube (Coup du matin)", "Matin (Lumière douce)", "Après-Midi (Plein soleil)", "Crépuscule (Coup du soir)", "Nuit"]
-    )
-
-with col_s3:
-    etat_maree = st.selectbox(
-        "Phase de marée",
-        ["PM-2h à PM+1h (Plein courant / Optimal)", "Montante (Etale BM à PM)", "Descendante (Jusant)", "Basse Mer (Etale)"]
-    )
-
-# 2. Récupération Météo (Open-Meteo)
-@st.cache_data(ttl=1800)
-def fetch_current_weather(lat, lon):
-    url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current=surface_pressure,wind_speed_10m,wind_direction_10m&hourly=surface_pressure&forecast_days=1"
-    try:
-        res = requests.get(url).json()
-        current = res.get("current", {})
-        hourly = res.get("hourly", {})
-        pression = current.get("surface_pressure", 1013.25)
-        vent_vitesse = current.get("wind_speed_10m", 15.0)
-        vent_dir = current.get("wind_direction_10m", 270)
-        pressions_hourly = hourly.get("surface_pressure", [])
-        delta_p = (pressions_hourly[3] - pressions_hourly[0]) if len(pressions_hourly) >= 4 else -1.5
-        return pression, vent_vitesse, vent_dir, delta_p
-    except Exception:
-        return 1013.25, 20.0, 240, -1.5
-
-pression, vent_vitesse, vent_dir, delta_p = fetch_current_weather(coords["lat"], coords["lon"])
-
-# 3. Calcul des sous-scores pondérés (V3+)
-score_moment_map = {
+MOMENTS_MAP = {
     "Aube (Coup du matin)": 95,
-    "Crépuscule (Coup du soir)": 90,
-    "Nuit": 78,
     "Matin (Lumière douce)": 65,
-    "Après-Midi (Plein soleil)": 48
+    "Après-Midi (Plein soleil)": 48,
+    "Crépuscule (Coup du soir)": 90,
+    "Nuit": 78
 }
-sub_moment = score_moment_map[moment]
 
-score_maree_map = {
-    "PM-2h à PM+1h (Plein courant / Optimal)": 95,
-    "Montante (Etale BM à PM)": 75,
-    "Descendante (Jusant)": 65,
-    "Basse Mer (Etale)": 40
-}
-sub_maree = score_maree_map[etat_maree]
+# 1. Sélection de la zone
+spot_nom = st.sidebar.selectbox("📍 Secteur de pêche", list(SPOTS.keys()))
+coords = SPOTS[spot_nom]
 
-sub_pression = 95 if (-3.0 <= delta_p <= -1.0) else (70 if delta_p < 0 else 45)
+# 2. Récupération Météo Horaire sur 16 Jours (Open-Meteo)
+@st.cache_data(ttl=3600)
+def fetch_15day_hourly(lat, lon):
+    url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&hourly=temperature_2m,surface_pressure,wind_speed_10m,wind_direction_10m&forecast_days=16&timezone=auto"
+    res = requests.get(url).json()
+    return res.get("hourly", {})
 
-is_vent_mer = 200 <= vent_dir <= 290
-sub_vent = 90 if (12 <= vent_vitesse <= 25 and is_vent_mer) else 55
+hourly_raw = fetch_15day_hourly(coords["lat"], coords["lon"])
 
-sub_houle = 80
-sub_carnet = 75
+if hourly_raw:
+    df_raw = pd.DataFrame(hourly_raw)
+    df_raw["time"] = pd.to_datetime(df_raw["time"])
+    df_raw["date"] = df_raw["time"].dt.strftime("%Y-%m-%d")
+    df_raw["hour"] = df_raw["time"].dt.hour
 
-# Impact pondéré sur le score final (Base /100)
-contrib_maree = 0.25 * sub_maree
-contrib_carnet = 0.20 * sub_carnet
-contrib_pression = 0.15 * sub_pression
-contrib_moment = 0.15 * sub_moment
-contrib_vent = 0.15 * sub_vent
-contrib_houle = 0.10 * sub_houle
+    # Mapping des heures vers les 5 tranches horaires
+    def get_moment_category(hour):
+        if 5 <= hour < 8:
+            return "Aube (Coup du matin)"
+        elif 8 <= hour < 13:
+            return "Matin (Lumière douce)"
+        elif 13 <= hour < 18:
+            return "Après-Midi (Plein soleil)"
+        elif 18 <= hour < 22:
+            return "Crépuscule (Coup du soir)"
+        else:
+            return "Nuit"
 
-score_global = contrib_maree + contrib_carnet + contrib_pression + contrib_moment + contrib_vent + contrib_houle
+    df_raw["moment"] = df_raw["hour"].apply(get_moment_category)
 
-# 4. Affichage du Score et Décomposition
-st.divider()
-st.header("2. Indice d'Activité & Décomposition du Score")
+    # Regroupement par Date et Moment
+    df_grouped = df_raw.groupby(["date", "moment"]).agg({
+        "wind_speed_10m": "mean",
+        "wind_direction_10m": "mean",
+        "surface_pressure": "mean"
+    }).reset_index()
 
-col_res1, col_res2 = st.columns([1, 2])
+    # Fonction de calcul du score V3+
+    def calculate_score(row):
+        sub_moment = MOMENTS_MAP.get(row["moment"], 60)
+        
+        # Simulation phase marée selon l'heure (pondération représentative)
+        sub_maree = 85 if row["moment"] in ["Aube (Coup du matin)", "Crépuscule (Coup du soir)"] else 65
+        
+        # Vent
+        is_vent_mer = 200 <= row["wind_direction_10m"] <= 290
+        sub_vent = 90 if (12 <= row["wind_speed_10m"] <= 25 and is_vent_mer) else 55
+        
+        # Pression
+        sub_pression = 85 if row["surface_pressure"] < 1015 else 60
+        
+        sub_houle = 75
+        sub_carnet = 70
 
-with col_res1:
-    st.metric(label=f"Score d'Activité Global — {spot_nom}", value=f"{round(score_global, 1)} / 100")
+        # Calcul pondéré Algorithme V3+
+        c_maree = 0.25 * sub_maree
+        c_carnet = 0.20 * sub_carnet
+        c_pression = 0.15 * sub_pression
+        c_moment = 0.15 * sub_moment
+        c_vent = 0.15 * sub_vent
+        c_houle = 0.10 * sub_houle
+
+        total = c_maree + c_carnet + c_pression + c_moment + c_vent + c_houle
+        
+        return pd.Series([
+            round(total, 1), sub_maree, sub_carnet, sub_pression, 
+            sub_moment, sub_vent, sub_houle,
+            c_maree, c_carnet, c_pression, c_moment, c_vent, c_houle
+        ])
+
+    score_cols = [
+        "score_total", "sub_maree", "sub_carnet", "sub_pression", 
+        "sub_moment", "sub_vent", "sub_houle",
+        "c_maree", "c_carnet", "c_pression", "c_moment", "c_vent", "c_houle"
+    ]
+    df_grouped[score_cols] = df_grouped.apply(calculate_score, axis=1)
+
+    # 3. Affichage de la vue Matrice 15 Jours
+    st.header("1. Grille des Prévisions sur 15 Jours (Par Créneau)")
+    st.caption("Score d'activité estimé (/100) pour chaque moment de la journée.")
+
+    # Pivot de la table pour affichage en matrice
+    moments_order = ["Aube (Coup du matin)", "Matin (Lumière douce)", "Après-Midi (Plein soleil)", "Crépuscule (Coup du soir)", "Nuit"]
+    matrix_df = df_grouped.pivot(index="date", columns="moment", values="score_total")
+    matrix_df = matrix_df.reindex(columns=[m for m in moments_order if m in matrix_df.columns])
+
+    # Affichage avec dégradé de couleur
+    st.dataframe(
+        matrix_df.style.background_gradient(cmap="RdYlGn", vmin=40, vmax=90).format("{:.1f}"),
+        use_container_width=True,
+        height=450
+    )
+
+    # 4. Inspection détaillée au clic / sélection
+    st.divider()
+    st.header("2. Analyse Détaillée d'une Tranche Horaire")
     
-    if "Aube" in moment or "Crépuscule" in moment:
-        st.success("💡 **Stratégie** : Leurres de surface & sub-surface (chasses de bordure).")
-    elif "Nuit" in moment:
-        st.info("💡 **Stratégie** : Pêche lente au leurre dur / souple près des berges.")
-    else:
-        st.warning("💡 **Stratégie** : Pêche creuse (cassants, sous-bois d'algues) au leurre souple.")
+    col_sel1, col_sel2 = st.columns(2)
+    with col_sel1:
+        selected_date = st.selectbox("Sélectionner la date", df_grouped["date"].unique())
+    with col_sel2:
+        selected_moment = st.selectbox("Sélectionner le créneau", moments_order)
 
-with col_res2:
-    st.subheader("📊 Contribution de chaque critère au score")
-    
-    df_decomp = pd.DataFrame({
-        "Critère": ["Marée & Courant (25%)", "Carnet & Historique (20%)", "Pression Atm. (15%)", "Moment du Jour (15%)", "Vent & Orientation (15%)", "Houle & Eau (10%)"],
-        "Score Brut (/100)": [sub_maree, sub_carnet, sub_pression, sub_moment, sub_vent, sub_houle],
-        "Points apportés": [contrib_maree, contrib_carnet, contrib_pression, contrib_moment, contrib_vent, contrib_houle]
-    }).set_index("Critère")
-    
-    st.bar_chart(df_decomp["Points apportés"])
+    # Extraction de la ligne sélectionnée
+    row_detail = df_grouped[(df_grouped["date"] == selected_date) & (df_grouped["moment"] == selected_moment)]
 
-st.table(df_decomp)
+    if not row_detail.empty:
+        r = row_detail.iloc[0]
+        
+        col_res1, col_res2 = st.columns([1, 2])
+        
+        with col_res1:
+            st.metric(
+                label=f"Score Global ({selected_date} — {selected_moment[:4]})", 
+                value=f"{r['score_total']} / 100"
+            )
+            
+            st.write(f"**Vent moyen** : {round(r['wind_speed_10m'], 1)} km/h ({round(r['wind_direction_10m'])}°)")
+            st.write(f"**Pression** : {round(r['surface_pressure'], 1)} hPa")
+
+            if "Aube" in selected_moment or "Crépuscule" in selected_moment:
+                st.success("💡 **Stratégie** : Leurres de surface & sub-surface (chasses de bordure).")
+            elif "Nuit" in selected_moment:
+                st.info("💡 **Stratégie** : Pêche lente au leurre dur / souple près des berges.")
+            else:
+                st.warning("💡 **Stratégie** : Pêche creuse (cassants, sous-bois d'algues) au leurre souple.")
+
+        with col_res2:
+            st.subheader("📊 Décomposition des points apportés au score")
+            
+            df_decomp = pd.DataFrame({
+                "Critère": [
+                    "Marée & Courant (25%)", 
+                    "Carnet & Historique (20%)", 
+                    "Pression Atm. (15%)", 
+                    "Moment du Jour (15%)", 
+                    "Vent & Orientation (15%)", 
+                    "Houle & Eau (10%)"
+                ],
+                "Score Brut (/100)": [
+                    r["sub_maree"], r["sub_carnet"], r["sub_pression"], 
+                    r["sub_moment"], r["sub_vent"], r["sub_houle"]
+                ],
+                "Points apportés": [
+                    r["c_maree"], r["c_carnet"], r["c_pression"], 
+                    r["c_moment"], r["c_vent"], r["c_houle"]
+                ]
+            }).set_index("Critère")
+            
+            st.bar_chart(df_decomp["Points apportés"])
+            st.table(df_decomp)
 
 # 5. Océanogramme SHOM
 st.divider()
