@@ -139,7 +139,6 @@ if not df_weather.empty:
         day_tide = tides_dict.get(date, {"max_coef": 70, "extrema": []})
         coef = day_tide["max_coef"]
 
-        # --- Évaluations détaillées avec descriptions explicites ---
         if coef >= 75: note_maree, desc_maree = 5, f"Excellent coefficient ({coef} >= 75) — Fortes veines de courant"
         elif coef >= 60: note_maree, desc_maree = 4, f"Bon coefficient ({coef})"
         elif coef >= 45: note_maree, desc_maree = 3, f"Coefficient moyen ({coef})"
@@ -215,12 +214,33 @@ if not df_weather.empty:
         st.dataframe(matrix_df.style.background_gradient(cmap="RdYlGn", vmin=40, vmax=90).format("{:.1f}"), use_container_width=True, height=400)
 
         st.divider()
-        st.header("🔍 Vue Détaillée par Créneau")
+        st.header("🌊 Détail des Marées du Jour")
+        selected_date_maree = st.selectbox("Choisir la date pour voir les marées", dates_list, key="sel_date_maree")
+        
+        day_info = tides_dict.get(selected_date_maree, {})
+        extrema = day_info.get("extrema", [])
+        
+        if extrema:
+            cols_tide = st.columns(len(extrema))
+            for idx, ext in enumerate(extrema):
+                with cols_tide[idx]:
+                    t_type = ext.get("type") # PM ou BM
+                    t_time = ext.get("time", "").split("T")[-1][:5] # Heure HH:MM
+                    t_height = ext.get("height", "N/A")
+                    t_coef = ext.get("coef", "-")
+                    
+                    label = "Pleine Mer (PM)" if t_type == "PM" else "Basse Mer (BM)"
+                    st.metric(label=f"{label} à {t_time}", value=f"{t_height} m", delta=f"Coef : {t_coef}" if t_type == "PM" else None)
+        else:
+            st.info("Données de marées non disponibles pour cette date.")
+
+        st.divider()
+        st.header("🔍 Vue Détaillée par Créneau & Critères")
         col_sel1, col_sel2 = st.columns(2)
         with col_sel1:
-            selected_date = st.selectbox("Sélectionner la date", df_grouped["date"].unique())
+            selected_date = st.selectbox("Sélectionner la date", df_grouped["date"].unique(), key="sel_date_detail")
         with col_sel2:
-            selected_moment = st.selectbox("Sélectionner le créneau", moments_order)
+            selected_moment = st.selectbox("Sélectionner le créneau", moments_order, key="sel_moment_detail")
 
         row_detail = df_grouped[(df_grouped["date"] == selected_date) & (df_grouped["moment"] == selected_moment)]
 
