@@ -139,17 +139,45 @@ if not df_weather.empty:
         day_tide = tides_dict.get(date, {"max_coef": 70, "extrema": []})
         coef = day_tide["max_coef"]
 
-        note_maree = 5 if coef >= 75 else (4 if coef >= 60 else 3)
-        note_press = 5 if pressure < 1010 else (3 if pressure <= 1022 else 2)
-        note_vent = 5 if (12 <= wind_speed <= 30 and wave_height >= 0.8) else 3
-        note_moment = 5 if moment in ["Aube (Coup du matin)", "Crépuscule (Coup du soir)"] else (4 if moment == "Nuit" else 3)
-        note_eau = 5 if (12 <= water_temp <= 20) else 3
+        # --- Évaluations détaillées avec descriptions explicites ---
+        if coef >= 75: note_maree, desc_maree = 5, f"Excellent coefficient ({coef} >= 75) — Fortes veines de courant"
+        elif coef >= 60: note_maree, desc_maree = 4, f"Bon coefficient ({coef})"
+        elif coef >= 45: note_maree, desc_maree = 3, f"Coefficient moyen ({coef})"
+        else: note_maree, desc_maree = 1, f"Morte-eau stricte ({coef})"
+
+        if pressure < 1010: note_press, desc_press = 5, f"Dépression / Baisse marquée ({round(pressure,1)} hPa)"
+        elif pressure <= 1022: note_press, desc_press = 3, f"Pression stable ({round(pressure,1)} hPa)"
+        else: note_press, desc_press = 2, f"Anticyclone durable ({round(pressure,1)} hPa)"
+
+        is_vent_favorable = 180 <= wind_dir <= 310
+        if 12 <= wind_speed <= 30 and is_vent_favorable and wave_height >= 0.8:
+            note_vent, desc_vent = 5, f"Vent Sud/Ouest ({round(wind_speed,1)} km/h) & Houle ({round(wave_height,1)}m)"
+        elif wind_speed < 8:
+            note_vent, desc_vent = 1, f"Calme plat total ({round(wind_speed,1)} km/h)"
+        else:
+            note_vent, desc_vent = 3, f"Vent modéré ({round(wind_speed,1)} km/h)"
+
+        if moment in ["Aube (Coup du matin)", "Crépuscule (Coup du soir)"]:
+            note_moment, desc_moment = 5, f"{moment} — Transition lumineuse idéale"
+        elif moment == "Nuit":
+            note_moment, desc_moment = 4, "Nuit — Excellent en été (bordures)"
+        elif cloud_cover >= 60:
+            note_moment, desc_moment = 3, f"Journée nuageuse ({round(cloud_cover)}%)"
+        else:
+            note_moment, desc_moment = 1, "Plein soleil en journée"
+
+        if 12 <= water_temp <= 20:
+            note_eau, desc_eau = 5, f"Température idéale ({round(water_temp,1)}°C)"
+        elif water_temp < 7:
+            note_eau, desc_eau = 1, f"Eau trop froide ({round(water_temp,1)}°C)"
+        else:
+            note_eau, desc_eau = 3, f"Eau fraîche/limite ({round(water_temp,1)}°C)"
         
-        note_carnet = 3
+        note_carnet, desc_carnet = 3, "Historique neutre"
         if bonus_historique_actif:
             similar_catches = [c for c in carnet_data if abs(c.get("coef", 70) - coef) <= 10]
             if similar_catches:
-                note_carnet = 5
+                note_carnet, desc_carnet = 5, f"🔥 Apprentissage IA : {len(similar_catches)} prise(s) sur ce type de coef"
 
         score_total = round(
             (note_maree * 0.25) + 
@@ -162,25 +190,66 @@ if not df_weather.empty:
 
         records.append({
             "date": date, "moment": moment, "score_total": score_total, "coef": coef,
-            "note_maree": note_maree, "note_press": note_press, "note_vent": note_vent,
-            "note_moment": note_moment, "note_eau": note_eau, "note_carnet": note_carnet,
+            "note_maree": note_maree, "desc_maree": desc_maree,
+            "note_press": note_press, "desc_press": desc_press,
+            "note_vent": note_vent, "desc_vent": desc_vent,
+            "note_moment": note_moment, "desc_moment": desc_moment,
+            "note_eau": note_eau, "desc_eau": desc_eau,
+            "note_carnet": note_carnet, "desc_carnet": desc_carnet,
         })
 
     df_grouped = pd.DataFrame(records)
     moments_order = ["Aube (Coup du matin)", "Matin (Lumière douce)", "Après-Midi (Plein soleil)", "Crépuscule (Coup du soir)", "Nuit"]
 
     tab_grille, tab_carnet, tab_analyse, tab_shom = st.tabs([
-        "📊 Grille de Décision (15J)", 
+        "📊 Grille & Vue Détaillée", 
         "📖 Carnet de Prises & Saisie", 
         "🧠 Auto-Apprentissage & Stats", 
         "🌊 Widget SHOM"
     ])
 
     with tab_grille:
-        st.header("Grille Globale des Conditions")
+        st.header("Grille Globale des Conditions (15 Jours)")
         matrix_df = df_grouped.pivot(index="date", columns="moment", values="score_total")
         matrix_df = matrix_df.reindex(columns=[m for m in moments_order if m in matrix_df.columns])
-        st.dataframe(matrix_df.style.background_gradient(cmap="RdYlGn", vmin=40, vmax=90).format("{:.1f}"), use_container_width=True, height=450)
+        st.dataframe(matrix_df.style.background_gradient(cmap="RdYlGn", vmin=40, vmax=90).format("{:.1f}"), use_container_width=True, height=400)
+
+        st.divider()
+        st.header("🔍 Vue Détaillée par Créneau")
+        col_sel1, col_sel2 = st.columns(2)
+        with col_sel1:
+            selected_date = st.selectbox("Sélectionner la date", df_grouped["date"].unique())
+        with col_sel2:
+            selected_moment = st.selectbox("Sélectionner le créneau", moments_order)
+
+        row_detail = df_grouped[(df_grouped["date"] == selected_date) & (df_grouped["moment"] == selected_moment)]
+
+        if not row_detail.empty:
+            r = row_detail.iloc[0]
+            st.subheader(f"Score Global du Créneau : {r['score_total']} / 100")
+
+            col_d1, col_d2 = st.columns(2)
+            with col_d1:
+                st.write("#### 🌊 Marée & Coefficients (25%)")
+                render_score_badge(r["note_maree"], r["desc_maree"])
+
+                st.write("#### 📉 Pression Atmosphérique (20%)")
+                render_score_badge(r["note_press"], r["desc_press"])
+
+                st.write("#### 🌬️ Vent, Houle & Orientation (20%)")
+                render_score_badge(r["note_vent"], r["desc_vent"])
+
+            with col_d2:
+                st.write("#### 🌅 Moment du Jour & Luminosité (15%)")
+                render_score_badge(r["note_moment"], r["desc_moment"])
+
+                st.write("#### 🌡️ Température de l'Eau (10%)")
+                render_score_badge(r["note_eau"], r["desc_eau"])
+
+                st.write("#### 📖 Carnet & Historique (10%)")
+                render_score_badge(r["note_carnet"], r["desc_carnet"])
+        else:
+            st.info("Aucune donnée disponible pour ce créneau précis.")
 
     with tab_carnet:
         st.header("📖 Enregistrer une Session ou une Prise")
