@@ -5,9 +5,9 @@ import pandas as pd
 st.set_page_config(page_title="Aide à la Décision - Pêche au Bar V3+", layout="wide")
 
 st.title("🎣 Aide à la Décision V3+ — Pêche au Bar")
-st.caption("Zone 50km Le Croisic & Côte Sauvage | Prévisions Horaire 15J, Marée & Décomposition")
+st.caption("Zone 50km Le Croisic & Côte Sauvage | Prévisions Horaire 15J, Marée Synchronisée & Décomposition")
 
-# Spots GPS & ID Ports
+# Spots GPS & ID Ports (Le Croisic = 80, St-Nazaire = 82)
 SPOTS = {
     "Côte Sauvage (Le Croisic)": {"lat": 47.2931, "lon": -2.5204, "port_id": "80"},
     "Pointe du Castelli (Piriac)": {"lat": 47.3781, "lon": -2.5512, "port_id": "80"},
@@ -30,24 +30,31 @@ MAREE_API_KEY = st.secrets.get("MAREE_API_KEY", "VOTRE_CLE_API_MAREE")
 spot_nom = st.sidebar.selectbox("📍 Secteur de pêche", list(SPOTS.keys()))
 coords = SPOTS[spot_nom]
 
-# 2. Récupération Marée (api.maree.info)
+# 2. Fonction d'appel API Marée dynamisée par DATE
 @st.cache_data(ttl=3600)
-def fetch_tide_info(port_id, api_key):
-    url = f"http://api.maree.info/m/tide/{port_id}?token={api_key}"
+def fetch_tide_info(port_id, target_date, api_key):
+    """
+    Interroge l'API pour la date exacte (YYYY-MM-DD)
+    """
+    url = f"https://api-maree.fr/tide-extrema?key={api_key}&site={port_id}&from={target_date}&to={target_date}"
     try:
         res = requests.get(url, timeout=5).json()
-        tides = res.get("tide", [])
-        if tides:
-            coef = int(tides[0].get("coef", 75))
-            # Récupération des horaires PM / BM
-            horaires = [f"{t.get('dateTime').split(' ')[1][:5]} ({t.get('type')})" for t in tides[:4]]
-            str_horaires = " | ".join(horaires)
+        if res.get("status") == "success" and target_date in res.get("data", {}):
+            day_data = res["data"][target_date]
+            coef = day_data.get("coefficient", "N/A")
+            
+            extrema = day_data.get("extrema", [])
+            horaires_list = []
+            for e in extrema:
+                heure = e.get("time")
+                type_m = "PM" if e.get("state") == "HIGH TIDE" else "BM"
+                horaires_list.append(f"{heure} ({type_m})")
+            
+            str_horaires = " | ".join(horaires_list)
             return coef, str_horaires
     except Exception:
         pass
-    return 75, "06:12 (BM) | 12:35 (PM) | 18:40 (BM) | 23:55 (PM)"  # Fallback
-
-coef_maree, horaires_maree = fetch_tide_info(coords["port_id"], MAREE_API_KEY)
+    return "N/A", "Données marée indisponibles (Vérifier clé API)"
 
 # 3. Récupération Météo 16J (Open-Meteo)
 @st.cache_data(ttl=3600)
@@ -84,12 +91,10 @@ if hourly_raw:
         "surface_pressure": "mean"
     }).reset_index()
 
-    # Calcul des scores V3+
+    # Calcul des sous-scores V3+
     def calculate_score(row):
         sub_moment = MOMENTS_MAP.get(row["moment"], 60)
-        
-        # Marée ajustée au coefficient réel
-        sub_maree = 90 if (65 <= coef_maree <= 85 and row["moment"] in ["Aube (Coup du matin)", "Crépuscule (Coup du soir)"]) else 65
+        sub_maree = 85 if row["moment"] in ["Aube (Coup du matin)", "Crépuscule (Coup du soir)"] else 65
         
         is_vent_mer = 200 <= row["wind_direction_10m"] <= 290
         sub_vent = 90 if (12 <= row["wind_speed_10m"] <= 25 and is_vent_mer) else 55
@@ -120,19 +125,23 @@ if hourly_raw:
     ]
     df_grouped[score_cols] = df_grouped.apply(calculate_score, axis=1)
 
-    # 4. Grille de Prévisions
+    # 4. Grille des Prévisions (Matrice)
     st.header("1. Grille des Prévisions sur 15 Jours (Par Créneau)")
     moments_order = ["Aube (Coup du matin)", "Matin (Lumière douce)", "Après-Midi (Plein soleil)", "Crépuscule (Coup du soir)", "Nuit"]
     matrix_df = df_grouped.pivot(index="date", columns="moment", values="score_total")
     matrix_df = matrix_df.reindex(columns=[m for m in moments_order if m in matrix_df.columns])
 
-    st.dataframe(
-        matrix_df.style.background_gradient(cmap="RdYlGn", vmin=40, vmax=90).format("{:.1f}"),
-        use_container_width=True,
-        height=400
-    )
+    # Affichage sécurisé de la matrice
+    try:
+        st.dataframe(
+            matrix_df.style.background_gradient(cmap="RdYlGn", vmin=40, vmax=90).format("{:.1f}"),
+            use_container_width=True,
+            height=400
+        )
+    except Exception:
+        st.dataframe(matrix_df, use_container_width=True, height=400)
 
-    # 5. Inspection Détaillée + Marée
+    # 5. Inspection Détaillée & Marée Dynamique
     st.divider()
     st.header("2. Analyse Détaillée du Créneau & Informations Marée")
     
@@ -141,6 +150,9 @@ if hourly_raw:
         selected_date = st.selectbox("Sélectionner la date", df_grouped["date"].unique())
     with col_sel2:
         selected_moment = st.selectbox("Sélectionner le créneau", moments_order)
+
+    # Appel de la marée pour la date SÉLECTIONNÉE
+    coef_maree, horaires_maree = fetch_tide_info(coords["port_id"], selected_date, MAREE_API_KEY)
 
     row_detail = df_grouped[(df_grouped["date"] == selected_date) & (df_grouped["moment"] == selected_moment)]
 
@@ -155,9 +167,8 @@ if hourly_raw:
                 value=f"{r['score_total']} / 100"
             )
             
-            # Bloc d'information Marée
-            st.markdown("### 🌊 Informations Marée du jour")
-            st.info(f"**Coefficient de Marée** : {coef_maree}\n\n**Horaires Étales (BM/PM)** : {horaires_maree}")
+            st.markdown("### 🌊 Marée du Jour (Dynamique)")
+            st.info(f"**Coefficient** : {coef_maree}\n\n**Horaires (BM/PM)** : {horaires_maree}")
 
             st.markdown("### 🍃 Conditions Météo")
             st.write(f"**Vent moyen** : {round(r['wind_speed_10m'], 1)} km/h ({round(r['wind_direction_10m'])}°)")
