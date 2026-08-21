@@ -1,7 +1,6 @@
 import streamlit as st
 import requests
 import pandas as pd
-import numpy as np
 
 st.set_page_config(page_title="Aide à la Décision - Pêche au Bar V3+", layout="wide")
 
@@ -28,34 +27,32 @@ MOMENTS_MAP = {
 spot_nom = st.sidebar.selectbox("📍 Secteur de pêche", list(SPOTS.keys()))
 coords = SPOTS[spot_nom]
 
-# 2. Récupération Météo & Hauteurs d'eau (Open-Meteo)
+# 2. Fonctions d'API sécurisées
 @st.cache_data(ttl=3600)
-def fetch_marine_data(lat, lon):
-    url = f"https://marine-api.open-meteo.com/v1/marine?latitude={lat}&longitude={lon}&hourly=sea_level_height_above_mean_sea_level&forecast_days=16&timezone=auto"
+def fetch_data(lat, lon):
+    url_marine = f"https://marine-api.open-meteo.com/v1/marine?latitude={lat}&longitude={lon}&hourly=sea_level_height_above_mean_sea_level&forecast_days=16&timezone=auto"
+    url_weather = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&hourly=temperature_2m,surface_pressure,wind_speed_10m,wind_direction_10m&forecast_days=16&timezone=auto"
+    
     try:
-        res = requests.get(url, timeout=10).json()
-        return pd.DataFrame(res.get("hourly", {}))
-    except Exception:
-        return pd.DataFrame()
+        res_m = requests.get(url_marine, timeout=8).json()
+        res_w = requests.get(url_weather, timeout=8).json()
+        
+        df_m = pd.DataFrame(res_m.get("hourly", {}))
+        df_w = pd.DataFrame(res_w.get("hourly", {}))
+        
+        if not df_m.empty and not df_w.empty:
+            df_m["time"] = pd.to_datetime(df_m["time"])
+            df_w["time"] = pd.to_datetime(df_w["time"])
+            return pd.merge(df_w, df_m, on="time")
+    except Exception as e:
+        st.error(f"Erreur de connexion aux API météo/marée : {e}")
+    return pd.DataFrame()
 
-@st.cache_data(ttl=3600)
-def fetch_weather_data(lat, lon):
-    url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&hourly=temperature_2m,surface_pressure,wind_speed_10m,wind_direction_10m&forecast_days=16&timezone=auto"
-    try:
-        res = requests.get(url, timeout=10).json()
-        return pd.DataFrame(res.get("hourly", {}))
-    except Exception:
-        return pd.DataFrame()
+df = fetch_data(coords["lat"], coords["lon"])
 
-df_tide = fetch_marine_data(coords["lat"], coords["lon"])
-df_weather = fetch_weather_data(coords["lat"], coords["lon"])
-
-if not df_tide.empty and not df_weather.empty:
-    df_tide["time"] = pd.to_datetime(df_tide["time"])
-    df_weather["time"] = pd.to_datetime(df_weather["time"])
-
-    # Détection horaire des étales PM / BM
-    heights = df_tide["sea_level_height_above_mean_sea_level"].values
+if not df.empty:
+    # Traitement des données
+    heights = df["sea_level_height_above_mean_sea_level"].values
     tide_type = ["--"] * len(heights)
     
     for i in range(1, len(heights) - 1):
@@ -64,21 +61,17 @@ if not df_tide.empty and not df_weather.empty:
         elif heights[i] < heights[i-1] and heights[i] < heights[i+1]:
             tide_type[i] = "BM"
             
-    df_tide["tide_event"] = tide_type
-
-    # Fusion Météo + Marée heure par heure
-    df = pd.merge(df_weather, df_tide[["time", "sea_level_height_above_mean_sea_level", "tide_event"]], on="time")
+    df["tide_event"] = tide_type
     df["date"] = df["time"].dt.strftime("%Y-%m-%d")
     df["hour"] = df["time"].dt.hour
 
-    # Calcul quotidien du marnage et du coefficient du jour
+    # Marnage et coefficient
     daily_stats = df.groupby("date")["sea_level_height_above_mean_sea_level"].agg(["min", "max"]).reset_index()
     daily_stats["marnage"] = daily_stats["max"] - daily_stats["min"]
     daily_stats["coef"] = (daily_stats["marnage"] * 18.5 + 20).clip(30, 115).astype(int)
 
     df = pd.merge(df, daily_stats[["date", "coef"]], on="date")
 
-    # Attribution du moment de la journée
     def assign_moment(hour):
         for name, cfg in MOMENTS_MAP.items():
             if hour in cfg["hours"]:
@@ -87,29 +80,19 @@ if not df_tide.empty and not df_weather.empty:
 
     df["moment"] = df["hour"].apply(assign_moment)
 
-    # 3. Aggrégation et calcul des scores croisés par créneau
-    def process_slot_score(group):
-        date = group["date"].iloc[0]
-        moment = group["moment"].iloc[0]
+    # Calcul des scores par groupe sans bug d'API Pandas
+    records = []
+    for (date, moment), group in df.groupby(["date", "moment"]):
         coef = group["coef"].iloc[0]
-        
         wind_speed = group["wind_speed_10m"].mean()
         wind_dir = group["wind_direction_10m"].mean()
         pressure = group["surface_pressure"].mean()
 
-        # ÉVALUATION DE LA MARÉE DANS CE CRÉNEAU
         has_pm = "PM" in group["tide_event"].values
         has_bm = "BM" in group["tide_event"].values
 
-        # Calcul sous-score Marée
-        if coef >= 80:
-            base_coef_score = 90
-        elif coef >= 55:
-            base_coef_score = 75
-        else:
-            base_coef_score = 55
+        base_coef_score = 90 if coef >= 80 else (75 if coef >= 55 else 55)
 
-        # La présence de la pleine mer (PM) sur le créneau booste la note
         if has_pm:
             sub_maree = min(100, base_coef_score + 15)
         elif has_bm:
@@ -117,19 +100,13 @@ if not df_tide.empty and not df_weather.empty:
         else:
             sub_maree = base_coef_score
 
-        # Sous-score Moment
         sub_moment = MOMENTS_MAP[moment]["weight"]
-
-        # Sous-score Vent (Onshore = 200° à 290°)
         is_vent_mer = 200 <= wind_dir <= 290
         sub_vent = 90 if (12 <= wind_speed <= 25 and is_vent_mer) else 55
-
-        # Autres sous-scores
         sub_pression = 85 if pressure < 1015 else 60
         sub_houle = 75
         sub_carnet = 70
 
-        # PONDÉRATION (100%)
         c_maree = 0.25 * sub_maree
         c_carnet = 0.20 * sub_carnet
         c_pression = 0.15 * sub_pression
@@ -139,11 +116,12 @@ if not df_tide.empty and not df_weather.empty:
 
         score_total = round(c_maree + c_carnet + c_pression + c_moment + c_vent + c_houle, 1)
 
-        # Extraction des heures exactes de PM/BM du créneau/jour
         events = group[group["tide_event"] != "--"]
-        etales_str = " | ".join([f"{r['tide_event']}: {r['time'].strftime('%H:%M')}" for _, r in events.iterrows()]) if not events.empty else "Pas d'étale dans ce créneau"
+        etales_str = " | ".join([f"{r['tide_event']}: {r['time'].strftime('%H:%M')}" for _, r in events.iterrows()]) if not events.empty else "Pas d'étale sur ce créneau"
 
-        return pd.Series({
+        records.append({
+            "date": date,
+            "moment": moment,
             "score_total": score_total,
             "coef": coef,
             "sub_maree": sub_maree,
@@ -164,9 +142,9 @@ if not df_tide.empty and not df_weather.empty:
             "etales_slot": etales_str
         })
 
-    df_grouped = df.groupby(["date", "moment"]).apply(process_slot_score, include_groups=False).reset_index()
+    df_grouped = pd.DataFrame(records)
 
-    # 4. Grille des Prévisions (Matrice)
+    # 4. Affichage Grille 15 Jours
     st.header("1. Grille des Prévisions sur 15 Jours")
     moments_order = ["Aube (Coup du matin)", "Matin (Lumière douce)", "Après-Midi (Plein soleil)", "Crépuscule (Coup du soir)", "Nuit"]
     matrix_df = df_grouped.pivot(index="date", columns="moment", values="score_total")
@@ -188,7 +166,6 @@ if not df_tide.empty and not df_weather.empty:
     with col_sel2:
         selected_moment = st.selectbox("Sélectionner le créneau", moments_order)
 
-    # Horaires PM/BM sur toute la journée sélectionnée
     df_day = df[df["date"] == selected_date]
     day_events = df_day[df_day["tide_event"] != "--"]
     all_day_etales = " | ".join([f"{r['tide_event']}: {r['time'].strftime('%H:%M')}" for _, r in day_events.iterrows()])
@@ -235,6 +212,8 @@ if not df_tide.empty and not df_weather.empty:
 
             st.bar_chart(df_decomp["Points apportés"])
             st.table(df_decomp)
+else:
+    st.warning("Chargement des données météo et marées en cours...")
 
 # 6. Widget SHOM
 st.divider()
