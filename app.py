@@ -29,10 +29,10 @@ MOMENTS_MAP = {
 spot_nom = st.sidebar.selectbox("📍 Secteur de pêche", list(SPOTS.keys()))
 coords = SPOTS[spot_nom]
 
-# 1. API Open-Meteo (Météo, Vent, Pression, Nuages, Houle et Température d'eau)
+# 1. API Météo Standard (Air, Vent, Pression, Nuages)
 @st.cache_data(ttl=3600)
 def fetch_weather_16days(lat, lon):
-    url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&hourly=temperature_2m,surface_pressure,wind_speed_10m,wind_direction_10m,cloud_cover,wave_height,sea_water_temperature&forecast_days=16&timezone=auto"
+    url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&hourly=temperature_2m,surface_pressure,wind_speed_10m,wind_direction_10m,cloud_cover&forecast_days=16&timezone=auto"
     try:
         res = requests.get(url, headers=HEADERS, timeout=10)
         if res.status_code != 200:
@@ -45,7 +45,21 @@ def fetch_weather_16days(lat, lon):
         st.error(f"❌ Erreur réseau Météo : {e}")
         return pd.DataFrame()
 
-# 2. API Marée Réelle
+# 2. API Marine Officielle (Houle & Température de l'eau exacte)
+@st.cache_data(ttl=3600)
+def fetch_marine_data(lat, lon):
+    url = f"https://marine-api.open-meteo.com/v1/marine?latitude={lat}&longitude={lon}&hourly=wave_height,sea_surface_temperature&forecast_days=7&timezone=auto"
+    try:
+        res = requests.get(url, headers=HEADERS, timeout=10)
+        if res.status_code != 200:
+            return pd.DataFrame()
+        df = pd.DataFrame(res.json()["hourly"])
+        df["time"] = pd.to_datetime(df["time"])
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+# 3. API Marée Réelle
 @st.cache_data(ttl=3600)
 def fetch_tides_15days(site_slug, start_date, end_date):
     url = f"https://api-maree.fr/tide-extrema?site={site_slug}&from={start_date}&to={end_date}&tz=Europe/Paris&key={API_KEY_MAREE}"
@@ -76,10 +90,18 @@ def render_score_badge(score, text):
     )
 
 df_weather = fetch_weather_16days(coords["lat"], coords["lon"])
+df_marine = fetch_marine_data(coords["lat"], coords["lon"])
 
 if not df_weather.empty:
     df_weather["date"] = df_weather["time"].dt.strftime("%Y-%m-%d")
     df_weather["hour"] = df_weather["time"].dt.hour
+
+    # Fusion avec les données marines si disponibles
+    if not df_marine.empty:
+        df_weather = pd.merge_asof(df_weather.sort_values("time"), df_marine.sort_values("time"), on="time")
+    else:
+        df_weather["wave_height"] = 1.0
+        df_weather["sea_surface_temperature"] = 15.0
 
     dates_list = sorted(df_weather["date"].unique())[:15]
     start_date, end_date = dates_list[0], dates_list[-1]
@@ -101,7 +123,7 @@ if not df_weather.empty:
         pressure = group["surface_pressure"].mean()
         cloud_cover = group["cloud_cover"].mean()
         wave_height = group["wave_height"].mean() if "wave_height" in group and not group["wave_height"].isna().all() else 1.0
-        water_temp = group["sea_water_temperature"].mean() if "sea_water_temperature" in group and not group["sea_water_temperature"].isna().all() else 15.0
+        water_temp = group["sea_surface_temperature"].mean() if "sea_surface_temperature" in group and not group["sea_surface_temperature"].isna().all() else 15.0
 
         day_tide = tides_dict.get(date, {"max_coef": 70, "extrema": []})
         coef = day_tide["max_coef"]
@@ -113,7 +135,7 @@ if not df_weather.empty:
         elif coef >= 40: note_maree, desc_maree = 2, f"Faible coefficient ({coef})"
         else: note_maree, desc_maree = 1, f"Morte-eau ({coef})"
 
-        # --- 2. Carnet & Historique (20%) - Neutre pour l'instant (3/5) en attendant la base ---
+        # --- 2. Carnet & Historique (20%) ---
         note_carnet, desc_carnet = 3, "Historique neutre (En attente intégration de vos prises)"
 
         # --- 3. Pression Atmosphérique (15%) ---
