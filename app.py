@@ -214,18 +214,21 @@ if not df_weather.empty:
         st.dataframe(matrix_df.style.background_gradient(cmap="RdYlGn", vmin=40, vmax=90).format("{:.1f}"), use_container_width=True, height=400)
 
         st.divider()
-        st.header("🌊 Détail des Marées du Jour")
-        selected_date_maree = st.selectbox("Choisir la date pour voir les marées", dates_list, key="sel_date_maree")
+        st.header("🔍 Analyse Détaillée de la Journée")
         
-        day_info = tides_dict.get(selected_date_maree, {})
+        # UN SEUL MENU DÉROULANT POUR LA DATE COMMUNE
+        selected_date = st.selectbox("📅 Sélectionner la date à analyser", df_grouped["date"].unique(), key="sel_date_commun")
+
+        st.markdown("### 🌊 Marées du Jour")
+        day_info = tides_dict.get(selected_date, {})
         extrema = day_info.get("extrema", [])
         
         if extrema:
             cols_tide = st.columns(len(extrema))
             for idx, ext in enumerate(extrema):
                 with cols_tide[idx]:
-                    t_type = ext.get("type") # PM ou BM
-                    t_time = ext.get("time", "").split("T")[-1][:5] # Heure HH:MM
+                    t_type = ext.get("type")
+                    t_time = ext.get("time", "").split("T")[-1][:5]
                     t_height = ext.get("height", "N/A")
                     t_coef = ext.get("coef", "-")
                     
@@ -234,13 +237,11 @@ if not df_weather.empty:
         else:
             st.info("Données de marées non disponibles pour cette date.")
 
-        st.divider()
-        st.header("🔍 Vue Détaillée par Créneau & Critères")
-        col_sel1, col_sel2 = st.columns(2)
-        with col_sel1:
-            selected_date = st.selectbox("Sélectionner la date", df_grouped["date"].unique(), key="sel_date_detail")
-        with col_sel2:
-            selected_moment = st.selectbox("Sélectionner le créneau", moments_order, key="sel_moment_detail")
+        st.markdown("---")
+        st.markdown("### ⏰ Détail par Créneau (Aube, Matin, etc.)")
+        
+        # Sélecteur de moment pour la date choisie
+        selected_moment = st.selectbox("Choisir le créneau horaire", moments_order, key="sel_moment_detail")
 
         row_detail = df_grouped[(df_grouped["date"] == selected_date) & (df_grouped["moment"] == selected_moment)]
 
