@@ -8,10 +8,10 @@ import math
 from streamlit_folium import st_folium
 import folium
 
-st.set_page_config(page_title="Aide à la Décision - Pêche au Bar V4.1", layout="wide")
+st.set_page_config(page_title="Aide à la Décision - Pêche au Bar V4.2", layout="wide")
 
-st.title("🎣 Aide à la Décision V4.1 — Pêche au Bar & Ports Dynamiques")
-st.caption("Géolocalisation dynamique, plus proches voisins météo/marées via l'API officielle & Carte des prises")
+st.title("🎣 Aide à la Décision V4.2 — Pêche au Bar & Stations Dynamiques")
+st.caption("Géolocalisation dynamique, couplage Météo/Marées & Carte des prises")
 
 API_KEY_MAREE = "9452804b6f6e7a5204505c36d252ea48"
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
@@ -48,7 +48,6 @@ def haversine(lat1, lon1, lat2, lon2):
 
 @st.cache_data(ttl=86400)
 def charger_ports_api(api_key):
-    """Charge dynamiquement la liste de tous les sites/ports depuis l'API Marée"""
     url = f"https://api-maree.fr/sites?key={api_key}"
     try:
         res = requests.get(url, headers=HEADERS, timeout=10)
@@ -57,7 +56,6 @@ def charger_ports_api(api_key):
             sites = data.get("sites", data if isinstance(data, list) else [])
             ports_propres = []
             for s in sites:
-                # Adaptation aux différents formats possibles des clés de l'API
                 s_id = s.get("site_id") or s.get("id") or s.get("code")
                 s_name = s.get("site_name") or s.get("name") or s_id
                 lat = s.get("latitude") or s.get("lat")
@@ -75,7 +73,6 @@ def charger_ports_api(api_key):
     except Exception:
         pass
     
-    # Fallback de secours si l'API des sites est injoignable
     return [
         {"nom": "Le Croisic", "lat": 47.2931, "lon": -2.5204, "site_maree": "le-croisic"},
         {"nom": "Piriac-sur-Mer", "lat": 47.3781, "lon": -2.5512, "site_maree": "piriac-sur-mer"},
@@ -83,7 +80,6 @@ def charger_ports_api(api_key):
         {"nom": "Pornichet", "lat": 47.2625, "lon": -2.3361, "site_maree": "pornichet"}
     ]
 
-# Chargement de la liste officielle des ports
 REFERENCE_SITES = charger_ports_api(API_KEY_MAREE)
 
 def trouver_station_la_plus_proche(lat, lon, liste_sites):
@@ -118,10 +114,13 @@ else:
     else:
         lat_cible, lon_cible = 47.2931, -2.5204
 
-# Recherche automatique du port le plus proche via la liste officielle chargée
+# Recherche automatique du port de marée le plus proche
 station_proche = trouver_station_la_plus_proche(lat_cible, lon_cible, REFERENCE_SITES)
-st.sidebar.markdown(f"**Port de Marée rattaché :** {station_proche['nom']}")
-st.sidebar.markdown(f"**Identifiant API :** `{station_proche['site_maree']}`")
+
+st.sidebar.divider()
+st.sidebar.markdown(f"**📍 Zone Météo / Spot actif :**\n`Lat: {round(lat_cible, 4)}, Lon: {round(lon_cible, 4)}`")
+st.sidebar.markdown(f"**🌊 Port de Marée rattaché :** {station_proche['nom']}")
+st.sidebar.markdown(f"**Identifiant API Marée :** `{station_proche['site_maree']}`")
 
 @st.cache_data(ttl=3600)
 def fetch_weather_16days(lat, lon):
@@ -323,7 +322,9 @@ if not df_weather.empty:
     ])
 
     with tab_grille:
-        st.header(f"Grille Globale (Port rattaché : {station_proche['nom']})")
+        st.header(f"Grille Globale")
+        st.caption(f"🎯 Données météo/vent basées sur le spot ({round(lat_cible, 4)}, {round(lon_cible, 4)}) — 🌊 Marées basées sur le port : **{station_proche['nom']}**")
+        
         matrix_df = df_grouped.pivot(index="date", columns="moment", values="score_total")
         matrix_df = matrix_df.reindex(columns=[m for m in moments_order if m in matrix_df.columns])
         st.dataframe(matrix_df.style.background_gradient(cmap="RdYlGn", vmin=40, vmax=90).format("{:.1f}"), use_container_width=True, height=400)
@@ -333,7 +334,7 @@ if not df_weather.empty:
         
         selected_date = st.selectbox("📅 Sélectionner la date à analyser", df_grouped["date"].unique(), key="sel_date_commun")
 
-        st.markdown("### 🌊 Marées du Jour")
+        st.markdown(f"### 🌊 Marées du Jour (Port de référence : {station_proche['nom']})")
         day_info = tides_dict.get(selected_date, {})
         extrema = day_info.get("extrema", [])
         
@@ -352,7 +353,7 @@ if not df_weather.empty:
             st.warning(f"⚠️ Données de marées indisponibles pour le port `{station_proche['nom']}` à la date du {selected_date}.")
 
         st.markdown("---")
-        st.markdown("### ⏰ Détail par Créneau")
+        st.markdown(f"### ⏰ Détail par Créneau (Météo du spot & Marées {station_proche['nom']})")
         selected_moment = st.selectbox("Choisir le créneau horaire", moments_order, key="sel_moment_detail")
 
         row_detail = df_grouped[(df_grouped["date"] == selected_date) & (df_grouped["moment"] == selected_moment)]
@@ -363,16 +364,16 @@ if not df_weather.empty:
 
             col_d1, col_d2 = st.columns(2)
             with col_d1:
-                st.write("#### 🌊 Marée & Coefficients (25%)")
+                st.write(f"#### 🌊 Marée & Coefficients (25%) [Port: {station_proche['nom']}]")
                 render_score_badge(r["note_maree"], r["desc_maree"])
-                st.write("#### 📉 Pression Atmosphérique (20%)")
+                st.write("#### 📉 Pression Atmosphérique (20%) [Spot Météo]")
                 render_score_badge(r["note_press"], r["desc_press"])
-                st.write("#### 🌬️ Vent, Houle & Orientation (20%)")
+                st.write("#### 🌬️ Vent, Houle & Orientation (20%) [Spot Météo]")
                 render_score_badge(r["note_vent"], r["desc_vent"])
             with col_d2:
                 st.write("#### 🌅 Moment du Jour (15%)")
                 render_score_badge(r["note_moment"], r["desc_moment"])
-                st.write("#### 🌡️ Température de l'Eau (10%)")
+                st.write("#### 🌡️ Température de l'Eau (10%) [Spot Météo]")
                 render_score_badge(r["note_eau"], r["desc_eau"])
                 st.write("#### 📖 Carnet & Historique (10%)")
                 render_score_badge(r["note_carnet"], r["desc_carnet"])
@@ -454,5 +455,6 @@ if not df_weather.empty:
 
     with tab_shom:
         st.header("Graphique SHOM Officiel")
+        st.caption(f"Affichage centré sur les coordonnées du spot : {round(lat_cible, 4)}, {round(lon_cible, 4)}")
         shom_url = f"https://services.data.shom.fr/oceano/render/html/widget?duration=4&delta-date=0&lon={lon_cible}&lat={lat_cible}&utc=1&lang=fr"
         st.components.v1.iframe(shom_url, height=500, scrolling=True)
