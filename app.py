@@ -49,7 +49,7 @@ def sauvegarder_carnet(carnet):
     with open(CARNET_FILE, "w", encoding="utf-8") as f:
         json.dump(carnet, f, ensure_ascii=False, indent=4)
 
-defhaversine(lat1, lon1, lat2, lon2):
+def haversine(lat1, lon1, lat2, lon2):
     """Calcule la distance en km entre deux points GPS (Formule de Haversine)"""
     R = 6371.0
     dlat = math.radians(lat2 - lat1)
@@ -78,7 +78,6 @@ if mode_selection == "Sélection rapide par liste":
     lat_cible, lon_cible = station_active["lat"], station_active["lon"]
 else:
     st.sidebar.info("Cliquez sur la carte ci-dessous pour définir votre zone de pêche.")
-    # Carte miniature de sélection
     m_sel = folium.Map(location=[47.3, -2.5], zoom_start=10)
     m_sel.add_child(folium.LatLngPopup())
     map_data = st_folium(m_sel, height=250, width="100%", key="map_selector")
@@ -88,10 +87,8 @@ else:
         lon_cible = map_data["last_clicked"]["lng"]
         st.sidebar.success(f"Position choisie : {round(lat_cible, 4)}, {round(lon_cible, 4)}")
     else:
-        # Valeur par défaut Le Croisic
         lat_cible, lon_cible = 47.2931, -2.5204
 
-# Recherche automatique des stations météo et marée les plus proches
 station_proche = trouver_station_la_plus_proche(lat_cible, lon_cible)
 st.sidebar.markdown(f"**Station Météo rattachée :** {station_proche['nom']}")
 st.sidebar.markdown(f"**Site de Marée rattaché :** `{station_proche['site_maree']}`")
@@ -352,13 +349,11 @@ if not df_weather.empty:
 
     with tab_carnet:
         st.header("📖 Enregistrer une Prise avec Localisation GPS")
-        st.info("Astuce : Clique sur la carte ci-dessous pour positionner précisément le lieu exact de ta prise, ou utilise tes coordonnées GPS actuelles.")
+        st.info("Astuce : Clique sur la carte ci-dessous pour positionner précisément le lieu exact de ta prise.")
 
-        # Carte interactive pour récupérer les coordonnées de la prise
         m_prise = folium.Map(location=[lat_cible, lon_cible], zoom_start=12)
         m_prise.add_child(folium.LatLngPopup())
         
-        # Affichage des anciennes prises sur la carte si elles ont des coordonnées
         for c in carnet_data:
             if "lat" in c and "lon" in c:
                 folium.Marker(
@@ -369,7 +364,6 @@ if not df_weather.empty:
 
         map_prise_data = st_folium(m_prise, height=350, width="100%", key="map_prise_click")
 
-        # Récupération du clic sur la carte pour pré-remplir le formulaire
         default_lat = lat_cible
         default_lon = lon_cible
         if map_prise_data and map_prise_data.get("last_clicked"):
@@ -407,7 +401,7 @@ if not df_weather.empty:
                 }
                 carnet_data.append(new_entry)
                 sauvegarder_carnet(carnet_data)
-                st.success("✅ Prise enregistrée et géolocalisée avec succès ! (Actualise pour voir le marqueur sur la carte)")
+                st.success("✅ Prise enregistrée et géolocalisée avec succès !")
 
         st.divider()
         st.subheader("📋 Historique tabulaire des prises")
