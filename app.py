@@ -1,7 +1,6 @@
 import streamlit as st
 import requests
 import pandas as pd
-import numpy as np
 
 st.set_page_config(page_title="Aide à la Décision - Pêche au Bar V3+", layout="wide")
 
@@ -10,7 +9,6 @@ st.caption("Zone 50km Le Croisic & Côte Sauvage | Calcul Marée Horaire Exacte 
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
-# 1. Configuration des Spots GPS
 SPOTS = {
     "Côte Sauvage (Le Croisic)": {"lat": 47.2931, "lon": -2.5204},
     "Pointe du Castelli (Piriac)": {"lat": 47.3781, "lon": -2.5512},
@@ -30,38 +28,46 @@ MOMENTS_MAP = {
 spot_nom = st.sidebar.selectbox("📍 Secteur de pêche", list(SPOTS.keys()))
 coords = SPOTS[spot_nom]
 
-# 2. Récupération des données Météo & Marée (7 jours max pour stabilité API)
-@st.cache_data(ttl=3600)
-def fetch_all_data(lat, lon):
+# Récupération stricte sans aucune donnée générée en cas de panne
+def fetch_strict_data(lat, lon):
     url_marine = f"https://marine-api.open-meteo.com/v1/marine?latitude={lat}&longitude={lon}&hourly=sea_level_height_above_mean_sea_level&forecast_days=7&timezone=auto"
     url_weather = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&hourly=temperature_2m,surface_pressure,wind_speed_10m,wind_direction_10m&forecast_days=7&timezone=auto"
     
     try:
-        res_m = requests.get(url_marine, headers=HEADERS, timeout=10).json()
-        res_w = requests.get(url_weather, headers=HEADERS, timeout=10).json()
+        res_m = requests.get(url_marine, headers=HEADERS, timeout=10)
+        res_w = requests.get(url_weather, headers=HEADERS, timeout=10)
+        
+        # Vérification stricte des codes HTTP
+        if res_m.status_code != 200:
+            st.error(f"❌ Échec de l'API Marée (Code {res_m.status_code}) : {res_m.text}")
+            return pd.DataFrame()
+        if res_w.status_code != 200:
+            st.error(f"❌ Échec de l'API Météo (Code {res_w.status_code}) : {res_w.text}")
+            return pd.DataFrame()
 
-        if "hourly" in res_m and "hourly" in res_w:
-            df_m = pd.DataFrame(res_m["hourly"])
-            df_w = pd.DataFrame(res_w["hourly"])
-            
-            if not df_m.empty and not df_w.empty:
-                df_m["time"] = pd.to_datetime(df_m["time"])
-                df_w["time"] = pd.to_datetime(df_w["time"])
-                return pd.merge(df_w, df_m, on="time")
+        data_m = res_m.json()
+        data_w = res_w.json()
+
+        if "hourly" not in data_m or "sea_level_height_above_mean_sea_level" not in data_m["hourly"]:
+            st.error("❌ Les données de hauteur d'eau de marée sont absentes de la réponse de l'API Marine.")
+            return pd.DataFrame()
+
+        df_m = pd.DataFrame(data_m["hourly"])
+        df_w = pd.DataFrame(data_w["hourly"])
+
+        df_m["time"] = pd.to_datetime(df_m["time"])
+        df_w["time"] = pd.to_datetime(df_w["time"])
+
+        return pd.merge(df_w, df_m, on="time")
+
+    except requests.exceptions.RequestException as e:
+        st.error(f"❌ Erreur réseau lors de la requête API : {e}")
+        return pd.DataFrame()
     except Exception as e:
-        st.sidebar.error(f"Erreur API : {e}")
+        st.error(f"❌ Erreur imprévue lors du traitement des données : {e}")
+        return pd.DataFrame()
 
-    # Données simulées temporaires si l'API ne répond pas du tout
-    times = pd.date_range(start=pd.Timestamp.now().floor('D'), periods=168, freq='h')
-    return pd.DataFrame({
-        "time": times,
-        "wind_speed_10m": [15.0] * 168,
-        "wind_direction_10m": [240.0] * 168,
-        "surface_pressure": [1013.0] * 168,
-        "sea_level_height_above_mean_sea_level": [2.5 + 1.5 * np.sin(i / 2) for i in range(168)]
-    })
-
-df = fetch_all_data(coords["lat"], coords["lon"])
+df = fetch_strict_data(coords["lat"], coords["lon"])
 
 if not df.empty:
     # Détection des étales (PM / BM)
@@ -78,7 +84,7 @@ if not df.empty:
     df["date"] = df["time"].dt.strftime("%Y-%m-%d")
     df["hour"] = df["time"].dt.hour
 
-    # Calcul du marnage et du coefficient quotidien
+    # Calcul du marnage et du coefficient quotidien réel
     daily_stats = df.groupby("date")["sea_level_height_above_mean_sea_level"].agg(["min", "max"]).reset_index()
     daily_stats["marnage"] = daily_stats["max"] - daily_stats["min"]
     daily_stats["coef"] = (daily_stats["marnage"] * 18.5 + 20).clip(30, 115).astype(int)
@@ -93,7 +99,7 @@ if not df.empty:
 
     df["moment"] = df["hour"].apply(assign_moment)
 
-    # Aggrégation et calcul des scores
+    # Calcul explicite des scores
     records = []
     for (date, moment), group in df.groupby(["date", "moment"]):
         coef = group["coef"].iloc[0]
@@ -157,7 +163,7 @@ if not df.empty:
 
     df_grouped = pd.DataFrame(records)
 
-    # 3. Grille des Prévisions
+    # 1. Grille des Prévisions
     st.header("1. Grille des Prévisions")
     moments_order = ["Aube (Coup du matin)", "Matin (Lumière douce)", "Après-Midi (Plein soleil)", "Crépuscule (Coup du soir)", "Nuit"]
     matrix_df = df_grouped.pivot(index="date", columns="moment", values="score_total")
@@ -169,7 +175,7 @@ if not df.empty:
         height=300
     )
 
-    # 4. Vue Détaillée
+    # 2. Vue Détaillée
     st.divider()
     st.header("2. Analyse Détaillée du Créneau & Marée")
 
@@ -226,7 +232,7 @@ if not df.empty:
             st.bar_chart(df_decomp["Points apportés"])
             st.table(df_decomp)
 
-# 5. Widget SHOM
+# 3. Océanogramme SHOM
 st.divider()
 st.header("3. Océanogramme SHOM (Graphique en Direct)")
 shom_url = f"https://services.data.shom.fr/oceano/render/html/widget?duration=4&delta-date=0&lon={coords['lon']}&lat={coords['lat']}&utc=1&lang=fr"
