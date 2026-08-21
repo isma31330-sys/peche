@@ -8,25 +8,14 @@ import math
 from streamlit_folium import st_folium
 import folium
 
-st.set_page_config(page_title="Aide à la Décision - Pêche au Bar V4.0", layout="wide")
+st.set_page_config(page_title="Aide à la Décision - Pêche au Bar V4.1", layout="wide")
 
-st.title("🎣 Aide à la Décision V4.0 — Pêche au Bar & Cartographie Intelligente")
-st.caption("Géolocalisation dynamique, plus proches voisins météo/marées & Carte des prises")
+st.title("🎣 Aide à la Décision V4.1 — Pêche au Bar & Ports Dynamiques")
+st.caption("Géolocalisation dynamique, plus proches voisins météo/marées via l'API officielle & Carte des prises")
 
 API_KEY_MAREE = "9452804b6f6e7a5204505c36d252ea48"
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 CARNET_FILE = "carnet_peche.json"
-
-# Référentiel étendu de stations météo / marées connues pour le calcul du plus proche voisin
-REFERENCE_SITES = [
-    {"nom": "Côte Sauvage (Le Croisic)", "lat": 47.2931, "lon": -2.5204, "site_maree": "le-croisic"},
-    {"nom": "Pointe du Castelli (Piriac)", "lat": 47.3781, "lon": -2.5512, "site_maree": "piriac-sur-mer"},
-    {"nom": "Baie de Mesquer", "lat": 47.3986, "lon": -2.4635, "site_maree": "piriac-sur-mer"},
-    {"nom": "Estuaire de la Loire (St-Nazaire)", "lat": 47.2300, "lon": -2.1800, "site_maree": "saint-nazaire"},
-    {"nom": "Île de Dumet", "lat": 47.4111, "lon": -2.6208, "site_maree": "piriac-sur-mer"},
-    {"nom": "Pornichet / Baie de La Baule", "lat": 47.2625, "lon": -2.3361, "site_maree": "pornichet"},
-    {"nom": "Le Pouliguen", "lat": 47.2764, "lon": -2.4278, "site_maree": "le-pouliguen"}
-]
 
 MOMENTS_MAP = {
     "Aube (Coup du matin)": {"hours": range(5, 8)},
@@ -50,7 +39,6 @@ def sauvegarder_carnet(carnet):
         json.dump(carnet, f, ensure_ascii=False, indent=4)
 
 def haversine(lat1, lon1, lat2, lon2):
-    """Calcule la distance en km entre deux points GPS (Formule de Haversine)"""
     R = 6371.0
     dlat = math.radians(lat2 - lat1)
     dlon = math.radians(lon2 - lon1)
@@ -58,10 +46,50 @@ def haversine(lat1, lon1, lat2, lon2):
     c = 2 * math.asin(math.sqrt(a))
     return R * c
 
-def trouver_station_la_plus_proche(lat, lon):
-    plus_proche = REFERENCE_SITES[0]
+@st.cache_data(ttl=86400)
+def charger_ports_api(api_key):
+    """Charge dynamiquement la liste de tous les sites/ports depuis l'API Marée"""
+    url = f"https://api-maree.fr/sites?key={api_key}"
+    try:
+        res = requests.get(url, headers=HEADERS, timeout=10)
+        if res.status_code == 200:
+            data = res.json()
+            sites = data.get("sites", data if isinstance(data, list) else [])
+            ports_propres = []
+            for s in sites:
+                # Adaptation aux différents formats possibles des clés de l'API
+                s_id = s.get("site_id") or s.get("id") or s.get("code")
+                s_name = s.get("site_name") or s.get("name") or s_id
+                lat = s.get("latitude") or s.get("lat")
+                lon = s.get("longitude") or s.get("lon")
+                
+                if s_id and lat is not None and lon is not None:
+                    ports_propres.append({
+                        "nom": str(s_name),
+                        "lat": float(lat),
+                        "lon": float(lon),
+                        "site_maree": str(s_id)
+                    })
+            if ports_propres:
+                return ports_propres
+    except Exception:
+        pass
+    
+    # Fallback de secours si l'API des sites est injoignable
+    return [
+        {"nom": "Le Croisic", "lat": 47.2931, "lon": -2.5204, "site_maree": "le-croisic"},
+        {"nom": "Piriac-sur-Mer", "lat": 47.3781, "lon": -2.5512, "site_maree": "piriac-sur-mer"},
+        {"nom": "Saint-Nazaire", "lat": 47.2300, "lon": -2.1800, "site_maree": "saint-nazaire"},
+        {"nom": "Pornichet", "lat": 47.2625, "lon": -2.3361, "site_maree": "pornichet"}
+    ]
+
+# Chargement de la liste officielle des ports
+REFERENCE_SITES = charger_ports_api(API_KEY_MAREE)
+
+def trouver_station_la_plus_proche(lat, lon, liste_sites):
+    plus_proche = liste_sites[0]
     min_dist = float('inf')
-    for station in REFERENCE_SITES:
+    for station in liste_sites:
         dist = haversine(lat, lon, station["lat"], station["lon"])
         if dist < min_dist:
             min_dist = dist
@@ -70,10 +98,11 @@ def trouver_station_la_plus_proche(lat, lon):
 
 # --- SÉLECTION DE LA ZONE SUR CARTE DANS LA SIDEBAR ---
 st.sidebar.header("🗺️ Sélection de la Zone")
-mode_selection = st.sidebar.radio("Méthode de ciblage", ["Carte interactive cliquable", "Sélection rapide par liste"])
+mode_selection = st.sidebar.radio("Méthode de ciblage", ["Carte interactive cliquable", "Recherche par nom de port"])
 
-if mode_selection == "Sélection rapide par liste":
-    choix_defaut = st.sidebar.selectbox("Secteur", [s["nom"] for s in REFERENCE_SITES])
+if mode_selection == "Recherche par nom de port":
+    noms_tires = sorted([s["nom"] for s in REFERENCE_SITES])
+    choix_defaut = st.sidebar.selectbox("Secteur / Port", noms_tires)
     station_active = next(s for s in REFERENCE_SITES if s["nom"] == choix_defaut)
     lat_cible, lon_cible = station_active["lat"], station_active["lon"]
 else:
@@ -89,9 +118,10 @@ else:
     else:
         lat_cible, lon_cible = 47.2931, -2.5204
 
-station_proche = trouver_station_la_plus_proche(lat_cible, lon_cible)
-st.sidebar.markdown(f"**Station Météo rattachée :** {station_proche['nom']}")
-st.sidebar.markdown(f"**Site de Marée rattaché :** `{station_proche['site_maree']}`")
+# Recherche automatique du port le plus proche via la liste officielle chargée
+station_proche = trouver_station_la_plus_proche(lat_cible, lon_cible, REFERENCE_SITES)
+st.sidebar.markdown(f"**Port de Marée rattaché :** {station_proche['nom']}")
+st.sidebar.markdown(f"**Identifiant API :** `{station_proche['site_maree']}`")
 
 @st.cache_data(ttl=3600)
 def fetch_weather_16days(lat, lon):
@@ -125,13 +155,23 @@ def fetch_tides_15days(site_slug, start_date, end_date):
         if res.status_code != 200: return {}
         data = res.json()
         tides_by_date = {}
-        if "data" in data:
-            for day in data["data"]:
-                date_key = day.get("date")
-                extrema = day.get("extrema", [])
-                coefs = [e["coef"] for e in extrema if e.get("type") == "PM" and "coef" in e]
-                max_coef = max(coefs) if coefs else 70
-                tides_by_date[date_key] = {"max_coef": max_coef, "extrema": extrema}
+        
+        days_array = []
+        if isinstance(data, list):
+            days_array = data
+        elif isinstance(data, dict):
+            days_array = data.get("data", data.get("days", []))
+
+        for day in days_array:
+            date_key = day.get("date") or day.get("day")
+            if not date_key:
+                continue
+            date_key = str(date_key).split("T")[0]
+            extrema = day.get("extrema", [])
+            coefs = [e.get("coef", 0) for e in extrema if e.get("type") == "PM" and e.get("coef")]
+            max_coef = max(coefs) if coefs else 70
+            tides_by_date[date_key] = {"max_coef": max_coef, "extrema": extrema}
+            
         return tides_by_date
     except Exception:
         return {}
@@ -186,17 +226,13 @@ if not df_weather.empty:
         group_sorted = group.sort_values("time")
         first_time_val = group_sorted["time"].iloc[0]
         past_weather = df_weather[(df_weather["time"] >= first_time_val - timedelta(hours=6)) & (df_weather["time"] < first_time_val)]
-        if not past_weather.empty:
-            pressure_delta = pressure - past_weather["surface_pressure"].mean()
-        else:
-            pressure_delta = 0.0
+        pressure_delta = pressure - past_weather["surface_pressure"].mean() if not past_weather.empty else 0.0
 
         day_info = tides_dict.get(date, {"max_coef": 70, "extrema": []})
         coef = day_info["max_coef"]
         extrema = day_info.get("extrema", [])
 
         mean_hour = group["hour"].mean()
-        
         is_near_pm = False
         pm_info_str = ""
         for ext in extrema:
@@ -223,7 +259,7 @@ if not df_weather.empty:
             note_maree, desc_maree = 1, f"Morte-eau stricte ({coef})"
 
         if pressure < 1010 or pressure_delta < -1.0:
-            note_press, desc_press = 5, f"Dépression / Baisse marquée ({round(pressure,1)} hPa, Δ: {round(pressure_delta,1)})"
+            note_press, desc_press = 5, f"Dépression / Baisse marquée ({round(pressure,1)} hPa)"
         elif pressure <= 1022 and pressure_delta <= -0.3:
             note_press, desc_press = 4, f"Pression en baisse favorable ({round(pressure,1)} hPa)"
         elif pressure <= 1022:
@@ -262,12 +298,8 @@ if not df_weather.empty:
                 note_carnet, desc_carnet = 5, f"🔥 IA : {len(similar_catches)} prise(s) sur ce type de coef"
 
         score_total = round(
-            (note_maree * 0.25) + 
-            (note_press * 0.20) + 
-            (note_vent * 0.20) + 
-            (note_moment * 0.15) + 
-            (note_eau * 0.10) + 
-            (note_carnet * 0.10), 2
+            (note_maree * 0.25) + (note_press * 0.20) + (note_vent * 0.20) + 
+            (note_moment * 0.15) + (note_eau * 0.10) + (note_carnet * 0.10), 2
         ) * 20
 
         records.append({
@@ -291,7 +323,7 @@ if not df_weather.empty:
     ])
 
     with tab_grille:
-        st.header(f"Grille Globale ({station_proche['nom']})")
+        st.header(f"Grille Globale (Port rattaché : {station_proche['nom']})")
         matrix_df = df_grouped.pivot(index="date", columns="moment", values="score_total")
         matrix_df = matrix_df.reindex(columns=[m for m in moments_order if m in matrix_df.columns])
         st.dataframe(matrix_df.style.background_gradient(cmap="RdYlGn", vmin=40, vmax=90).format("{:.1f}"), use_container_width=True, height=400)
@@ -317,7 +349,7 @@ if not df_weather.empty:
                     label = "Pleine Mer (PM)" if t_type == "PM" else "Basse Mer (BM)"
                     st.metric(label=f"{label} à {t_time}", value=f"{t_height} m", delta=f"Coef : {t_coef}" if t_type == "PM" else None)
         else:
-            st.info("Données de marées non disponibles pour cette date.")
+            st.warning(f"⚠️ Données de marées indisponibles pour le port `{station_proche['nom']}` à la date du {selected_date}.")
 
         st.markdown("---")
         st.markdown("### ⏰ Détail par Créneau")
@@ -390,14 +422,9 @@ if not df_weather.empty:
                 coef_jour = tides_dict.get(date_str, {}).get("max_coef", 70)
                 
                 new_entry = {
-                    "date": date_str,
-                    "lat": lat_saisi,
-                    "lon": lon_saisi,
-                    "nb_poissons": nb_poissons,
-                    "taille_max": taille_max,
-                    "leurre": leurre_utilise,
-                    "commentaire": commentaire,
-                    "coef": coef_jour
+                    "date": date_str, "lat": lat_saisi, "lon": lon_saisi,
+                    "nb_poissons": nb_poissons, "taille_max": taille_max,
+                    "leurre": leurre_utilise, "commentaire": commentaire, "coef": coef_jour
                 }
                 carnet_data.append(new_entry)
                 sauvegarder_carnet(carnet_data)
