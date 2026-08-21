@@ -24,9 +24,46 @@ MOMENTS_MAP = {
     "Nuit": 78
 }
 
-# 2. Définition de coords en haut du script
 spot_nom = st.sidebar.selectbox("📍 Secteur de pêche", list(SPOTS.keys()))
 coords = SPOTS[spot_nom]
+
+# 2. Récupération Marée Gratuite (Open-Meteo Marine)
+@st.cache_data(ttl=3600)
+def fetch_tide_data(lat, lon, target_date):
+    url = f"https://marine-api.open-meteo.com/v1/marine?latitude={lat}&longitude={lon}&hourly=sea_level_height_above_mean_sea_level&forecast_days=16&timezone=auto"
+    try:
+        res = requests.get(url, timeout=5).json()
+        hourly = res.get("hourly", {})
+        if hourly:
+            df_tide = pd.DataFrame(hourly)
+            df_tide["time"] = pd.to_datetime(df_tide["time"])
+            df_day = df_tide[df_tide["time"].dt.strftime("%Y-%m-%d") == target_date].copy()
+            
+            if not df_day.empty:
+                heights = df_day["sea_level_height_above_mean_sea_level"].tolist()
+                
+                # Calcul de l'mplitude pour estimer le coefficient
+                amp = max(heights) - min(heights)
+                estimated_coef = min(120, max(20, int(amp * 22 + 20)))
+                
+                # Détection des pics (PM) et creux (BM)
+                extrema = []
+                for i in range(1, len(df_day) - 1):
+                    prev_h = heights[i-1]
+                    curr_h = heights[i]
+                    next_h = heights[i+1]
+                    t_str = df_day.iloc[i]["time"].strftime("%H:%M")
+                    
+                    if curr_h > prev_h and curr_h > next_h:
+                        extrema.append(f"{t_str} (PM)")
+                    elif curr_h < prev_h and curr_h < next_h:
+                        extrema.append(f"{t_str} (BM)")
+                
+                str_horaires = " | ".join(extrema) if extrema else "Données de marée lissées"
+                return estimated_coef, str_horaires
+    except Exception:
+        pass
+    return "N/A", "Indisponible"
 
 # 3. Récupération Météo 16J (Open-Meteo)
 @st.cache_data(ttl=3600)
@@ -115,15 +152,18 @@ if hourly_raw:
     except Exception:
         st.dataframe(matrix_df, use_container_width=True, height=400)
 
-    # 5. Inspection Détaillée
+    # 5. Inspection Détaillée + Marée
     st.divider()
-    st.header("2. Analyse Détaillée du Créneau")
+    st.header("2. Analyse Détaillée du Créneau & Marée")
     
     col_sel1, col_sel2 = st.columns(2)
     with col_sel1:
         selected_date = st.selectbox("Sélectionner la date", df_grouped["date"].unique())
     with col_sel2:
         selected_moment = st.selectbox("Sélectionner le créneau", moments_order)
+
+    # Récupération dynamique de la marée pour la date SÉLECTIONNÉE
+    coef_maree, horaires_maree = fetch_tide_data(coords["lat"], coords["lon"], selected_date)
 
     row_detail = df_grouped[(df_grouped["date"] == selected_date) & (df_grouped["moment"] == selected_moment)]
 
@@ -137,6 +177,9 @@ if hourly_raw:
                 label=f"Score Global ({selected_date} — {selected_moment[:4]})", 
                 value=f"{r['score_total']} / 100"
             )
+
+            st.markdown("### 🌊 Informations Marée")
+            st.info(f"**Coeff. estimé** : {coef_maree}\n\n**Étales (BM/PM)** : {horaires_maree}")
 
             st.markdown("### 🍃 Conditions Météo")
             st.write(f"**Vent moyen** : {round(r['wind_speed_10m'], 1)} km/h ({round(r['wind_direction_10m'])}°)")
@@ -174,7 +217,7 @@ if hourly_raw:
             st.bar_chart(df_decomp["Points apportés"])
             st.table(df_decomp)
 
-# 6. Océanogramme SHOM pour les marées et courants exacts
+# 6. Océanogramme SHOM
 st.divider()
 st.header("3. Océanogramme SHOM (Marée & Hauteur d'eau exactes)")
 shom_url = f"https://services.data.shom.fr/oceano/render/html/widget?duration=4&delta-date=0&lon={coords['lon']}&lat={coords['lat']}&utc=1&lang=fr"
