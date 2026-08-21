@@ -1,11 +1,12 @@
 import streamlit as st
 import requests
 import pandas as pd
+import numpy as np
 
 st.set_page_config(page_title="Aide à la Décision - Pêche au Bar V3+", layout="wide")
 
 st.title("🎣 Aide à la Décision V3+ — Pêche au Bar")
-st.caption("Zone 50km Le Croisic & Côte Sauvage | Calcul Marée Horaire Exacte & Météo")
+st.caption("Zone 50km Le Croisic & Côte Sauvage | Analyse Météo & Conditions")
 
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
 
@@ -28,62 +29,39 @@ MOMENTS_MAP = {
 spot_nom = st.sidebar.selectbox("📍 Secteur de pêche", list(SPOTS.keys()))
 coords = SPOTS[spot_nom]
 
-# Récupération stricte sans aucune donnée générée en cas de panne
-def fetch_strict_data(lat, lon):
-    # API Météo & Marée unifiée avec le bon nom de paramètre
-    url_weather = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&hourly=temperature_2m,surface_pressure,wind_speed_10m,wind_direction_10m,sea_level_height&forecast_days=7&timezone=auto"
+def fetch_weather_and_waves(lat, lon):
+    # API Open-Meteo Météo + Vagues (Variables 100% valides)
+    url_w = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&hourly=temperature_2m,surface_pressure,wind_speed_10m,wind_direction_10m&forecast_days=7&timezone=auto"
+    url_m = f"https://marine-api.open-meteo.com/v1/marine?latitude={lat}&longitude={lon}&hourly=wave_height,wave_period&forecast_days=7&timezone=auto"
     
     try:
-        res_w = requests.get(url_weather, headers=HEADERS, timeout=10)
-        
+        res_w = requests.get(url_w, headers=HEADERS, timeout=10)
+        res_m = requests.get(url_m, headers=HEADERS, timeout=10)
+
         if res_w.status_code != 200:
-            st.error(f"❌ Échec de l'API (Code {res_w.status_code}) : {res_w.text}")
+            st.error(f"❌ Échec de l'API Météo (Code {res_w.status_code}) : {res_w.text}")
+            return pd.DataFrame()
+        if res_m.status_code != 200:
+            st.error(f"❌ Échec de l'API Vagues (Code {res_m.status_code}) : {res_m.text}")
             return pd.DataFrame()
 
-        data_w = res_w.json()
+        df_w = pd.DataFrame(res_w.json()["hourly"])
+        df_m = pd.DataFrame(res_m.json()["hourly"])
 
-        if "hourly" not in data_w or "sea_level_height" not in data_w["hourly"]:
-            st.error("❌ La variable 'sea_level_height' est introuvable dans la réponse API.")
-            return pd.DataFrame()
-
-        df_w = pd.DataFrame(data_w["hourly"])
         df_w["time"] = pd.to_datetime(df_w["time"])
-        
-        # Renommage explicite pour correspondre au reste du script
-        df_w["sea_level_height_above_mean_sea_level"] = df_w["sea_level_height"]
+        df_m["time"] = pd.to_datetime(df_m["time"])
 
-        return df_w
+        return pd.merge(df_w, df_m, on="time", how="inner")
 
-    except requests.exceptions.RequestException as e:
-        st.error(f"❌ Erreur réseau lors de la requête API : {e}")
-        return pd.DataFrame()
     except Exception as e:
-        st.error(f"❌ Erreur imprévue lors du traitement : {e}")
+        st.error(f"❌ Erreur lors de la récupération météo : {e}")
         return pd.DataFrame()
 
-df = fetch_strict_data(coords["lat"], coords["lon"])
+df = fetch_weather_and_waves(coords["lat"], coords["lon"])
 
 if not df.empty:
-    # Détection des étales (PM / BM)
-    heights = df["sea_level_height_above_mean_sea_level"].values
-    tide_type = ["--"] * len(heights)
-    
-    for i in range(1, len(heights) - 1):
-        if heights[i] > heights[i-1] and heights[i] > heights[i+1]:
-            tide_type[i] = "PM"
-        elif heights[i] < heights[i-1] and heights[i] < heights[i+1]:
-            tide_type[i] = "BM"
-            
-    df["tide_event"] = tide_type
     df["date"] = df["time"].dt.strftime("%Y-%m-%d")
     df["hour"] = df["time"].dt.hour
-
-    # Calcul du marnage et du coefficient quotidien réel
-    daily_stats = df.groupby("date")["sea_level_height_above_mean_sea_level"].agg(["min", "max"]).reset_index()
-    daily_stats["marnage"] = daily_stats["max"] - daily_stats["min"]
-    daily_stats["coef"] = (daily_stats["marnage"] * 18.5 + 20).clip(30, 115).astype(int)
-
-    df = pd.merge(df, daily_stats[["date", "coef"]], on="date")
 
     def assign_moment(hour):
         for name, cfg in MOMENTS_MAP.items():
@@ -93,85 +71,55 @@ if not df.empty:
 
     df["moment"] = df["hour"].apply(assign_moment)
 
-    # Calcul explicite des scores
     records = []
     for (date, moment), group in df.groupby(["date", "moment"]):
-        coef = group["coef"].iloc[0]
         wind_speed = group["wind_speed_10m"].mean()
         wind_dir = group["wind_direction_10m"].mean()
         pressure = group["surface_pressure"].mean()
-
-        has_pm = "PM" in group["tide_event"].values
-        has_bm = "BM" in group["tide_event"].values
-
-        base_coef_score = 90 if coef >= 80 else (75 if coef >= 55 else 55)
-
-        if has_pm:
-            sub_maree = min(100, base_coef_score + 15)
-        elif has_bm:
-            sub_maree = base_coef_score - 5
-        else:
-            sub_maree = base_coef_score
+        wave_height = group["wave_height"].mean()
 
         sub_moment = MOMENTS_MAP[moment]["weight"]
         is_vent_mer = 200 <= wind_dir <= 290
         sub_vent = 90 if (12 <= wind_speed <= 25 and is_vent_mer) else 55
         sub_pression = 85 if pressure < 1015 else 60
-        sub_houle = 75
+        sub_houle = 85 if 0.4 <= wave_height <= 1.2 else 50
         sub_carnet = 70
 
-        c_maree = 0.25 * sub_maree
-        c_carnet = 0.20 * sub_carnet
-        c_pression = 0.15 * sub_pression
-        c_moment = 0.15 * sub_moment
-        c_vent = 0.15 * sub_vent
-        c_houle = 0.10 * sub_houle
-
-        score_total = round(c_maree + c_carnet + c_pression + c_moment + c_vent + c_houle, 1)
-
-        events = group[group["tide_event"] != "--"]
-        etales_str = " | ".join([f"{r['tide_event']}: {r['time'].strftime('%H:%M')}" for _, r in events.iterrows()]) if not events.empty else "Pas d'étale sur ce créneau"
+        # Score météo/mer basé sur données réelles API
+        score_total = round(
+            (0.35 * sub_moment) + 
+            (0.25 * sub_vent) + 
+            (0.20 * sub_pression) + 
+            (0.10 * sub_houle) + 
+            (0.10 * sub_carnet), 1
+        )
 
         records.append({
             "date": date,
             "moment": moment,
             "score_total": score_total,
-            "coef": coef,
-            "sub_maree": sub_maree,
-            "sub_carnet": sub_carnet,
-            "sub_pression": sub_pression,
-            "sub_moment": sub_moment,
-            "sub_vent": sub_vent,
-            "sub_houle": sub_houle,
-            "c_maree": c_maree,
-            "c_carnet": c_carnet,
-            "c_pression": c_pression,
-            "c_moment": c_moment,
-            "c_vent": c_vent,
-            "c_houle": c_houle,
             "wind_speed": wind_speed,
             "wind_dir": wind_dir,
             "pressure": pressure,
-            "etales_slot": etales_str
+            "wave_height": wave_height
         })
 
     df_grouped = pd.DataFrame(records)
 
-    # 1. Grille des Prévisions
-    st.header("1. Grille des Prévisions")
+    # 1. Grille Météo
+    st.header("1. Grille des Prévisions Météo & Mer (7 Jours)")
     moments_order = ["Aube (Coup du matin)", "Matin (Lumière douce)", "Après-Midi (Plein soleil)", "Crépuscule (Coup du soir)", "Nuit"]
     matrix_df = df_grouped.pivot(index="date", columns="moment", values="score_total")
     matrix_df = matrix_df.reindex(columns=[m for m in moments_order if m in matrix_df.columns])
 
     st.dataframe(
         matrix_df.style.background_gradient(cmap="RdYlGn", vmin=40, vmax=90).format("{:.1f}"),
-        use_container_width=True,
-        height=300
+        use_container_width=True
     )
 
     # 2. Vue Détaillée
     st.divider()
-    st.header("2. Analyse Détaillée du Créneau & Marée")
+    st.header("2. Analyse Détaillée du Créneau")
 
     col_sel1, col_sel2 = st.columns(2)
     with col_sel1:
@@ -179,55 +127,18 @@ if not df.empty:
     with col_sel2:
         selected_moment = st.selectbox("Sélectionner le créneau", moments_order)
 
-    df_day = df[df["date"] == selected_date]
-    day_events = df_day[df_day["tide_event"] != "--"]
-    all_day_etales = " | ".join([f"{r['tide_event']}: {r['time'].strftime('%H:%M')}" for _, r in day_events.iterrows()])
-
     row_detail = df_grouped[(df_grouped["date"] == selected_date) & (df_grouped["moment"] == selected_moment)]
 
     if not row_detail.empty:
         r = row_detail.iloc[0]
-        col_res1, col_res2 = st.columns([1, 2])
+        st.metric(label=f"Score Météo / Vent / Pression", value=f"{r['score_total']} / 100")
+        st.write(f"**Vent moyen** : {round(r['wind_speed'], 1)} km/h ({round(r['wind_dir'])}°)")
+        st.write(f"**Pression** : {round(r['pressure'], 1)} hPa")
+        st.write(f"**Hauteur de houle** : {round(r['wave_height'], 2)} m")
 
-        with col_res1:
-            st.metric(
-                label=f"Score Global ({selected_date} — {selected_moment[:4]})", 
-                value=f"{r['score_total']} / 100"
-            )
-
-            st.markdown("### 🌊 Marée Exacte du Jour")
-            st.info(f"**Coefficient du jour** : {r['coef']}\n\n**Étales du jour** : {all_day_etales}\n\n**Événement sur ce créneau** : {r['etales_slot']}")
-
-            st.markdown("### 🍃 Conditions Météo")
-            st.write(f"**Vent moyen** : {round(r['wind_speed'], 1)} km/h ({round(r['wind_dir'])}°)")
-            st.write(f"**Pression** : {round(r['pressure'], 1)} hPa")
-
-        with col_res2:
-            st.subheader("📊 Décomposition des points apportés au score")
-            df_decomp = pd.DataFrame({
-                "Critère": [
-                    "Marée & Coeff (25%)", 
-                    "Carnet & Historique (20%)", 
-                    "Pression Atm. (15%)", 
-                    "Moment du Jour (15%)", 
-                    "Vent & Orientation (15%)", 
-                    "Houle & Eau (10%)"
-                ],
-                "Score Brut (/100)": [
-                    r["sub_maree"], r["sub_carnet"], r["sub_pression"], 
-                    r["sub_moment"], r["sub_vent"], r["sub_houle"]
-                ],
-                "Points apportés": [
-                    r["c_maree"], r["c_carnet"], r["c_pression"], 
-                    r["c_moment"], r["c_vent"], r["c_houle"]
-                ]
-            }).set_index("Critère")
-
-            st.bar_chart(df_decomp["Points apportés"])
-            st.table(df_decomp)
-
-# 3. Océanogramme SHOM
+# 3. Widget SHOM Officiel (Seule source 100% exacte pour les marées FR)
 st.divider()
-st.header("3. Océanogramme SHOM (Graphique en Direct)")
+st.header("3. Marée Exacte & Océanogramme SHOM")
+st.info("Pour éviter toute approximation sur le calcul des coefficients et des hauteurs d'eau, le graphique officiel du SHOM est intégré directement ci-dessous.")
 shom_url = f"https://services.data.shom.fr/oceano/render/html/widget?duration=4&delta-date=0&lon={coords['lon']}&lat={coords['lat']}&utc=1&lang=fr"
 st.components.v1.iframe(shom_url, height=550, scrolling=True)
