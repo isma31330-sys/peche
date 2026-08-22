@@ -9,10 +9,10 @@ from streamlit_folium import st_folium
 import folium
 from streamlit_geolocation import streamlit_geolocation
 
-st.set_page_config(page_title="Aide à la Décision - Pêche au Bar V4.3", layout="wide")
+st.set_page_config(page_title="Aide à la Décision - Pêche au Bar V4.5", layout="wide")
 
-st.title("🎣 Aide à la Décision V4.3 — Pêche au Bar & GPS Téléphone")
-st.caption("Géolocalisation dynamique, GPS du téléphone, couplage Météo/Marées & Carte des prises")
+st.title("🎣 Aide à la Décision V4.5 — Pêche au Bar & Météo")
+st.caption("Géolocalisation, GPS téléphone, couplage Météo/Marées & Critère d'ensoleillement optimisé")
 
 API_KEY_MAREE = "9452804b6f6e7a5204505c36d252ea48"
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
@@ -101,7 +101,7 @@ mode_selection = st.sidebar.radio("Méthode de ciblage", [
     "📍 GPS du téléphone (Navigateur)"
 ])
 
-lat_cible, lon_cible = 47.2931, -2.5204 # Valeur par défaut
+lat_cible, lon_cible = 47.2931, -2.5204 
 
 if mode_selection == "📍 GPS du téléphone (Navigateur)":
     st.sidebar.info("Clique sur le bouton ci-dessous pour autoriser la lecture de ta position GPS.")
@@ -119,7 +119,7 @@ elif mode_selection == "Recherche par nom de port":
     station_active = next(s for s in REFERENCE_SITES if s["nom"] == choix_defaut)
     lat_cible, lon_cible = station_active["lat"], station_active["lon"]
 
-else: # Carte interactive cliquable
+else: 
     st.sidebar.info("Clique sur la carte ci-dessous pour définir votre zone de pêche.")
     m_sel = folium.Map(location=[47.3, -2.5], zoom_start=10)
     m_sel.add_child(folium.LatLngPopup())
@@ -130,7 +130,6 @@ else: # Carte interactive cliquable
         lon_cible = map_data["last_clicked"]["lng"]
         st.sidebar.success(f"Position choisie : {round(lat_cible, 4)}, {round(lon_cible, 4)}")
 
-# Recherche automatique du port de marée le plus proche en fonction des coordonnées actives
 station_proche = trouver_station_la_plus_proche(lat_cible, lon_cible, REFERENCE_SITES)
 
 st.sidebar.divider()
@@ -140,7 +139,7 @@ st.sidebar.markdown(f"**Identifiant API Marée :** `{station_proche['site_maree'
 
 @st.cache_data(ttl=3600)
 def fetch_weather_16days(lat, lon):
-    url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&hourly=temperature_2m,surface_pressure,wind_speed_10m,wind_direction_10m,cloud_cover&forecast_days=16&timezone=auto"
+    url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&hourly=temperature_2m,surface_pressure,wind_speed_10m,wind_direction_10m,cloud_cover,precipitation&forecast_days=16&timezone=auto"
     try:
         res = requests.get(url, headers=HEADERS, timeout=10)
         if res.status_code != 200: return pd.DataFrame()
@@ -235,6 +234,7 @@ if not df_weather.empty:
         wind_dir = group["wind_direction_10m"].mean()
         pressure = group["surface_pressure"].mean()
         cloud_cover = group["cloud_cover"].mean()
+        precipitation = group["precipitation"].mean() if "precipitation" in group.columns else 0.0
         wave_height = group["wave_height"].mean() if not group["wave_height"].isna().all() else 1.0
         water_temp = group["sea_surface_temperature"].mean() if not group["sea_surface_temperature"].isna().all() else 15.0
 
@@ -290,14 +290,24 @@ if not df_weather.empty:
         else:
             note_vent, desc_vent = 3, f"Vent modéré ({round(wind_speed,1)} km/h)"
 
+        # Critère Météo / Ensoleillement mis à jour (Partiellement nuageux = 5/5, Grand beau = 4/5)
+        if precipitation > 1.0:
+            note_ciel, desc_ciel = 1, f"Pluie / Averses marquées ({round(precipitation, 1)} mm)"
+        elif precipitation > 0.1:
+            note_ciel, desc_ciel = 2, f"Bruine / Faibles pluies ({round(precipitation, 1)} mm)"
+        elif 21 <= cloud_cover <= 50:
+            note_ciel, desc_ciel = 5, f"Partiellement nuageux / Idéal ({round(cloud_cover)}% de nuages)"
+        elif cloud_cover <= 20:
+            note_ciel, desc_ciel = 4, f"Grand beau temps / Ciel dégagé ({round(cloud_cover)}%)"
+        else:
+            note_ciel, desc_ciel = 3, f"Entièrement couvert / Nuageux ({round(cloud_cover)}%)"
+
         if moment in ["Aube (Coup du matin)", "Crépuscule (Coup du soir)"]:
             note_moment, desc_moment = 5, f"{moment} — Transition lumineuse"
         elif moment == "Nuit":
             note_moment, desc_moment = 4, "Nuit — Excellent en été"
-        elif cloud_cover >= 60:
-            note_moment, desc_moment = 3, f"Nuageux ({round(cloud_cover)}%)"
         else:
-            note_moment, desc_moment = 1, "Plein soleil"
+            note_moment, desc_moment = 3, "Journée standard"
 
         if 12 <= water_temp <= 20:
             note_eau, desc_eau = 5, f"Température idéale ({round(water_temp,1)}°C)"
@@ -313,8 +323,13 @@ if not df_weather.empty:
                 note_carnet, desc_carnet = 5, f"🔥 IA : {len(similar_catches)} prise(s) sur ce type de coef"
 
         score_total = round(
-            (note_maree * 0.25) + (note_press * 0.20) + (note_vent * 0.20) + 
-            (note_moment * 0.15) + (note_eau * 0.10) + (note_carnet * 0.10), 2
+            (note_maree * 0.25) + 
+            (note_press * 0.15) + 
+            (note_vent * 0.10) + 
+            (note_ciel * 0.15) + 
+            (note_moment * 0.15) + 
+            (note_eau * 0.10) + 
+            (note_carnet * 0.10), 2
         ) * 20
 
         records.append({
@@ -322,6 +337,7 @@ if not df_weather.empty:
             "note_maree": note_maree, "desc_maree": desc_maree,
             "note_press": note_press, "desc_press": desc_press,
             "note_vent": note_vent, "desc_vent": desc_vent,
+            "note_ciel": note_ciel, "desc_ciel": desc_ciel,
             "note_moment": note_moment, "desc_moment": desc_moment,
             "note_eau": note_eau, "desc_eau": desc_eau,
             "note_carnet": note_carnet, "desc_carnet": desc_carnet,
@@ -339,7 +355,7 @@ if not df_weather.empty:
 
     with tab_grille:
         st.header(f"Grille Globale")
-        st.caption(f"🎯 Données météo/vent basées sur le spot ({round(lat_cible, 4)}, {round(lon_cible, 4)}) — 🌊 Marées basées sur le port : **{station_proche['nom']}**")
+        st.caption(f"🎯 Données météo basées sur le spot ({round(lat_cible, 4)}, {round(lon_cible, 4)}) — 🌊 Marées basées sur le port : **{station_proche['nom']}**")
         
         matrix_df = df_grouped.pivot(index="date", columns="moment", values="score_total")
         matrix_df = matrix_df.reindex(columns=[m for m in moments_order if m in matrix_df.columns])
@@ -361,15 +377,14 @@ if not df_weather.empty:
                     t_type = ext.get("type")
                     t_time = ext.get("time", "").split("T")[-1][:5]
                     t_height = ext.get("height", "N/A")
-                    t_coef = ext.get("coef", "-")
                     
                     label = "Pleine Mer (PM)" if t_type == "PM" else "Basse Mer (BM)"
-                    st.metric(label=f"{label} à {t_time}", value=f"{t_height} m", delta=f"Coef : {t_coef}" if t_type == "PM" else None)
+                    st.metric(label=f"{label} à {t_time}", value=f"{t_height} m", delta=f"Coef : {ext.get('coef', '-')}" if t_type == "PM" else None)
         else:
             st.warning(f"⚠️ Données de marées indisponibles pour le port `{station_proche['nom']}` à la date du {selected_date}.")
 
         st.markdown("---")
-        st.markdown(f"### ⏰ Détail par Créneau (Météo du spot & Marées {station_proche['nom']})")
+        st.markdown(f"### ⏰ Détail par Créneau")
         selected_moment = st.selectbox("Choisir le créneau horaire", moments_order, key="sel_moment_detail")
 
         row_detail = df_grouped[(df_grouped["date"] == selected_date) & (df_grouped["moment"] == selected_moment)]
@@ -380,16 +395,18 @@ if not df_weather.empty:
 
             col_d1, col_d2 = st.columns(2)
             with col_d1:
-                st.write(f"#### 🌊 Marée & Coefficients (25%) [Port: {station_proche['nom']}]")
+                st.write(f"#### 🌊 Marée & Coefficients (25%)")
                 render_score_badge(r["note_maree"], r["desc_maree"])
-                st.write("#### 📉 Pression Atmosphérique (20%) [Spot Météo]")
+                st.write("#### 📉 Pression Atmosphérique (15%)")
                 render_score_badge(r["note_press"], r["desc_press"])
-                st.write("#### 🌬️ Vent, Houle & Orientation (20%) [Spot Météo]")
+                st.write("#### 🌬️ Vent & Houle (10%)")
                 render_score_badge(r["note_vent"], r["desc_vent"])
+                st.write("#### ☀️ Météo & Ensoleillement (15%)")
+                render_score_badge(r["note_ciel"], r["desc_ciel"])
             with col_d2:
                 st.write("#### 🌅 Moment du Jour (15%)")
                 render_score_badge(r["note_moment"], r["desc_moment"])
-                st.write("#### 🌡️ Température de l'Eau (10%) [Spot Météo]")
+                st.write("#### 🌡️ Température de l'Eau (10%)")
                 render_score_badge(r["note_eau"], r["desc_eau"])
                 st.write("#### 📖 Carnet & Historique (10%)")
                 render_score_badge(r["note_carnet"], r["desc_carnet"])
