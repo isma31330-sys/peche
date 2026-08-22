@@ -4,19 +4,20 @@ import pandas as pd
 import json
 import os
 from datetime import datetime, timedelta, date
+import time
 import math
 from urllib.parse import quote
 from streamlit_folium import st_folium
 import folium
 
 # ============================================================
-# AIDE À LA DÉCISION PÊCHE V5
+# AIDE À LA DÉCISION PÊCHE V5.2
 # Bar & Daurade royale - Le Croisic / Sud Bretagne
 #
-# V5 :
+# V5.2 :
 # - profils espèce + technique
 # - 10 spots préconfigurés autour du Croisic (~20 km)
-# - météo 16 j
+# - météo 14 j, point de référence fixe par défaut
 # - météo marine : houle, direction, période, SST, courant
 # - marées api-maree.fr
 # - phase de marée continue
@@ -38,7 +39,7 @@ import folium
 # ============================================================
 
 st.set_page_config(
-    page_title="Indice Pêche V5 — Bar & Daurade",
+    page_title="Indice Pêche V5.2 — Bar & Daurade",
     page_icon="🎣",
     layout="wide",
 )
@@ -770,33 +771,82 @@ def sauvegarder_carnet(carnet):
 # -----------------------------
 # API
 # -----------------------------
-@st.cache_data(ttl=3600)
+def _open_meteo_get(url, label="Open-Meteo"):
+    """GET robuste : retries sur 429/5xx et attente progressive."""
+    last_error = None
+    for attempt in range(4):
+        try:
+            r = requests.get(
+                url,
+                headers={**HEADERS, "Accept": "application/json", "Connection": "close"},
+                timeout=20,
+            )
+            if r.status_code == 429:
+                retry_after = r.headers.get("Retry-After")
+                try:
+                    wait = min(20, max(2, int(float(retry_after)))) if retry_after else 3 * (attempt + 1)
+                except Exception:
+                    wait = 3 * (attempt + 1)
+                last_error = RuntimeError(f"{label}: HTTP 429 — limite de requêtes atteinte")
+                if attempt < 3:
+                    time.sleep(wait)
+                    continue
+                raise last_error
+
+            if r.status_code >= 500:
+                last_error = RuntimeError(f"{label}: serveur HTTP {r.status_code}")
+                if attempt < 3:
+                    time.sleep(2 * (attempt + 1))
+                    continue
+                raise last_error
+
+            r.raise_for_status()
+            return r.json()
+
+        except (requests.RequestException, RuntimeError) as e:
+            last_error = e
+            if attempt < 3:
+                time.sleep(1.5 * (attempt + 1))
+            else:
+                raise last_error
+
+    raise last_error or RuntimeError(f"{label}: erreur inconnue")
+
+
+def _hourly_to_df(data):
+    hourly = data.get("hourly", {})
+    if not hourly or "time" not in hourly:
+        raise ValueError("Réponse Open-Meteo sans données horaires.")
+    df = pd.DataFrame(hourly)
+    df["time"] = pd.to_datetime(df["time"])
+    for c in df.columns:
+        if c != "time":
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
+
+
+@st.cache_data(ttl=21600, max_entries=12, show_spinner=False)
 def fetch_weather(lat, lon):
+    lat = round(float(lat), 2)
+    lon = round(float(lon), 2)
     url = (
         "https://api.open-meteo.com/v1/forecast"
         f"?latitude={lat}&longitude={lon}"
         "&hourly=temperature_2m,surface_pressure,wind_speed_10m,"
         "wind_direction_10m,cloud_cover,precipitation"
-        "&forecast_days=16&past_hours=24&timezone=auto"
+        "&forecast_days=14&timezone=Europe%2FParis"
     )
     try:
-        r = requests.get(url, headers=HEADERS, timeout=15)
-        r.raise_for_status()
-        data = r.json()
-        df = pd.DataFrame(data["hourly"])
-        df["time"] = pd.to_datetime(df["time"])
-        for c in df.columns:
-            if c != "time":
-                df[c] = pd.to_numeric(df[c], errors="coerce")
-        return df
+        return _hourly_to_df(_open_meteo_get(url, "Météo Open-Meteo"))
     except Exception as e:
-        st.warning(f"Météo indisponible : {e}")
+        st.warning(f"Météo indisponible après plusieurs tentatives : {e}")
         return pd.DataFrame()
 
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=21600, max_entries=12, show_spinner=False)
 def fetch_marine(lat, lon):
-    # Open-Meteo Marine : jusqu'à 8 jours de prévision sur cet endpoint.
+    lat = round(float(lat), 2)
+    lon = round(float(lon), 2)
     variables = (
         "wave_height,wave_direction,wave_period,"
         "sea_surface_temperature,ocean_current_velocity,ocean_current_direction"
@@ -804,21 +854,13 @@ def fetch_marine(lat, lon):
     url = (
         "https://marine-api.open-meteo.com/v1/marine"
         f"?latitude={lat}&longitude={lon}"
-        f"&hourly={variables}&forecast_days=8&past_hours=24"
-        "&timezone=auto&cell_selection=sea"
+        f"&hourly={variables}&forecast_days=8"
+        "&timezone=Europe%2FParis&cell_selection=sea"
     )
     try:
-        r = requests.get(url, headers=HEADERS, timeout=15)
-        r.raise_for_status()
-        data = r.json()
-        df = pd.DataFrame(data["hourly"])
-        df["time"] = pd.to_datetime(df["time"])
-        for c in df.columns:
-            if c != "time":
-                df[c] = pd.to_numeric(df[c], errors="coerce")
-        return df
+        return _hourly_to_df(_open_meteo_get(url, "Marine Open-Meteo"))
     except Exception as e:
-        st.warning(f"Données marines indisponibles : {e}")
+        st.warning(f"Données marines indisponibles après plusieurs tentatives : {e}")
         return pd.DataFrame()
 
 
@@ -863,7 +905,7 @@ def fetch_tides(site_slug, start_date, end_date):
 # -----------------------------
 # Interface
 # -----------------------------
-st.title("🎣 Indice de Pêche V5 — Bar & Daurade royale")
+st.title("🎣 Indice de Pêche V5.2 — Bar & Daurade royale")
 st.caption(
     "Le Croisic / Sud Bretagne · météo · marée · courant · houle · SST · historique personnel"
 )
@@ -889,19 +931,33 @@ with st.sidebar:
 
     st.divider()
     st.header("🗺️ Position météo")
-    use_spot_coords = st.checkbox("Utiliser les coordonnées du spot", value=True)
+    use_spot_coords = st.checkbox(
+    "Utiliser les coordonnées exactes du spot",
+    value=False,
+)
 
-# Coordonnées météo : par défaut le spot choisi.
-lat_cible, lon_cible = spot["lat"], spot["lon"]
+# Par défaut, une seule cellule météo de référence au Croisic est utilisée.
+# Cela évite de multiplier les appels Open-Meteo lorsque l'on change de spot.
+if use_spot_coords:
+    lat_cible, lon_cible = spot["lat"], spot["lon"]
+    st.sidebar.caption(
+        "⚠️ Coordonnées exactes activées : peut générer une nouvelle requête API."
+    )
+else:
+    lat_cible, lon_cible = CENTER["lat"], CENTER["lon"]
+    st.sidebar.caption(
+        f"Météo de référence : {CENTER['nom']} "
+        f"({CENTER['lat']:.4f}, {CENTER['lon']:.4f})"
+    )
 
-if not use_spot_coords:
-    st.sidebar.write("Position personnalisée")
-    lat_cible = st.sidebar.number_input(
-        "Latitude", value=float(lat_cible), format="%.5f"
-    )
-    lon_cible = st.sidebar.number_input(
-        "Longitude", value=float(lon_cible), format="%.5f"
-    )
+# -----------------------------
+# Contrôle des appels API
+# -----------------------------
+st.sidebar.divider()
+if st.sidebar.button("🔄 Actualiser météo / mer"):
+    fetch_weather.clear()
+    fetch_marine.clear()
+    st.rerun()
 
 # -----------------------------
 # Chargement données
@@ -911,7 +967,14 @@ with st.spinner("Chargement météo, mer et marées..."):
     df_marine = fetch_marine(lat_cible, lon_cible)
 
 if df_weather.empty:
-    st.error("Impossible de récupérer les données météo.")
+    st.error(
+        "❌ Impossible de récupérer les données météo pour le moment. "
+        "Open-Meteo a probablement limité l'adresse IP de l'hébergement."
+    )
+    st.info(
+        "Attends quelques minutes puis clique sur **🔄 Actualiser météo / mer**. "
+        "Laisse l'option « coordonnées exactes du spot » désactivée."
+    )
     st.stop()
 
 if not df_marine.empty:
@@ -1455,7 +1518,7 @@ with tab_sources:
 # -----------------------------
 st.divider()
 st.caption(
-    "Indice Pêche V5 — outil d'aide à la décision. "
+    "Indice Pêche V5.2 — outil d'aide à la décision. "
     "Un score élevé indique une combinaison de conditions plus proche "
     "des hypothèses du modèle ; il ne garantit pas une prise."
 )
