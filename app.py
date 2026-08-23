@@ -1309,6 +1309,29 @@ def current_score_value(speed_ms, species):
     return 3.0
 
 
+def _extrema_window(tides_dict, date_key):
+    """Concatène les extrema de la veille, du jour et du lendemain, pour
+    permettre à tide_phase_score()/shom_current_at()/shom_field_at_hour()
+    d'encadrer correctement les heures proches de minuit (continuité entre
+    jours au lieu de se limiter aux seuls événements du jour, ce qui
+    produisait des 'Phase incomplète' près des bornes de journée).
+    """
+    try:
+        d = pd.Timestamp(date_key).date()
+    except Exception:
+        return tides_dict.get(date_key, {}).get("extrema", [])
+
+    keys = [
+        (d - timedelta(days=1)).strftime("%Y-%m-%d"),
+        date_key,
+        (d + timedelta(days=1)).strftime("%Y-%m-%d"),
+    ]
+    combined = []
+    for k in keys:
+        combined.extend(tides_dict.get(k, {}).get("extrema", []))
+    return combined
+
+
 def shom_field_at_hour(shom_ds, tides_dict, date_key, hour_int, reference, lat_center, lon_center, radius_km=15.0):
     """Champ de courant 2D (tous les points SHOM proches du spot) pour une
     heure donnée d'un jour donné. Contrairement à shom_current_txt() qui ne
@@ -1994,25 +2017,14 @@ def _load_shom_from_supabase_zones(lat, lon):
 # Chargement du fichier SHOM : upload manuel prioritaire s'il est fourni,
 # sinon sélection automatique dans Supabase selon le spot analysé (table
 # shom_zones, remplie une fois via upload_shom_zones.py).
+# Le statut de chargement est affiché dans l'onglet "🌊 Courants SHOM"
+# dédié, pas dans la barre latérale.
 shom_zone_names = []
 if shom_file is not None:
     shom_ds, shom_error = _load_shom_with_shared_cache(shom_file, ZONE, shom_reference)
 else:
     shom_ds, shom_zone_names = _load_shom_from_supabase_zones(spot["lat"], spot["lon"])
     shom_error = None
-
-if shom_error:
-    st.sidebar.error(f"Fichier SHOM illisible : {shom_error}")
-elif shom_ds is not None and shom_zone_names:
-    st.sidebar.success(f"✅ Courants SHOM (Supabase, zone {', '.join(shom_zone_names)})")
-elif shom_ds is not None:
-    st.sidebar.success("✅ Courants SHOM chargés (cache partagé) : utilisés dans le score horaire")
-else:
-    st.sidebar.caption(
-        "Courants SHOM : aucune zone Supabase pour ce point — "
-        "importer le paquet TXT/ZIP manuellement, ou lancer "
-        "upload_shom_zones.py pour cette zone."
-    )
 
 # La météo est toujours interrogée au point exact du secteur analysé
 # (spot connu ou point cliqué librement) — plus de cellule de référence
@@ -2612,16 +2624,21 @@ with tab_shom:
         "Pour un coefficient réel entre 45 et 95, V6 interpole uniquement ces "
         "deux situations, puis convertit U/V en vitesse et direction."
     )
-    if shom_ds is None:
+    if shom_error:
+        st.error(f"Fichier SHOM illisible : {shom_error}")
+    elif shom_ds is None:
         st.info(
             "Importe le paquet **Courants de marée 2D** (.zip/.txt) dans la "
             "barre latérale. Le produit SHOM est annoncé comme gratuit et sous "
             "Licence Ouverte 2.0."
         )
         st.markdown("**Source SHOM :**")
-        st.markdown("urlPage officielle SHOM — Courants de marée 2Dhttps://diffusion.shom.fr/marees/courants-de-maree/courants2d/courants-2d.html")
+        st.markdown("[Page officielle SHOM — Courants de marée 2D](https://diffusion.shom.fr/marees/courants-de-maree/courants2d/courants-2d.html)")
     else:
-        st.success("Fichier SHOM chargé et disponible pour le calcul horaire.")
+        if shom_zone_names:
+            st.success(f"✅ Courants SHOM chargés depuis Supabase — zone(s) : {', '.join(shom_zone_names)}")
+        else:
+            st.success("✅ Fichier SHOM importé manuellement, chargé et disponible pour le calcul horaire.")
         if isinstance(shom_ds, dict) and shom_ds.get("kind") == "txt":
             st.write("Format : TXT SHOM")
             st.write("Points chargés :", len(shom_ds["data"]))
