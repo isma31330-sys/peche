@@ -271,21 +271,32 @@ def clamp(x, lo=0.0, hi=10.0):
     return max(lo, min(hi, x))
 
 
-# Seuils partagés par TOUS les éléments colorés de l'interface (tableaux,
-# pastilles des boutons de jour, badges de détail) : un dégradé continu
-# rendait les notes moyennes (~50) trop proches du jaune neutre, alors
-# qu'une note de 50/100 doit clairement se lire comme défavorable.
+# Échelle de couleur partagée par TOUS les éléments colorés de l'interface
+# (tableaux, pastilles des boutons de jour, badges de détail) :
+# ≤50 = rouge plein (mauvais), 100 = vert plein (excellent),
+# dégradé continu rouge → orange → vert entre les deux.
+def _mix_rgb(c1, c2, t):
+    return tuple(round(c1[i] + (c2[i] - c1[i]) * t) for i in range(3))
+
+
+def score_rgb_100(v):
+    v = max(0.0, min(100.0, float(v)))
+    RED, ORANGE, GREEN = (229, 57, 53), (255, 152, 0), (67, 160, 71)
+    if v <= 50:
+        return RED
+    if v <= 75:
+        return _mix_rgb(RED, ORANGE, (v - 50) / 25)
+    return _mix_rgb(ORANGE, GREEN, (v - 75) / 25)
+
+
 def score_css_100(val):
-    """Couleur de fond/texte pour une note sur 100 (bandes, pas dégradé)."""
+    """Couleur de fond pour une note sur 100, dégradé continu rouge→orange→vert."""
     try:
         v = float(val)
     except Exception:
         return ""
-    if v >= 65:
-        return "background-color:#c8e6c9;color:#1b5e20"
-    if v >= 40:
-        return "background-color:#ffe0b2;color:#8a5300"
-    return "background-color:#ffcdd2;color:#8a1c1c"
+    r, g, b = score_rgb_100(v)
+    return f"background-color:rgb({r},{g},{b});color:#ffffff"
 
 
 def styled_score_table(df, column):
@@ -1754,7 +1765,10 @@ with tab_dashboard:
             icon=folium.Icon(color="red", icon="map-pin"),
         ).add_to(m_main)
 
-    main_map_data = st_folium(m_main, height=420, width="100%", key="main_point_map")
+    main_map_data = st_folium(
+        m_main, height=420, width="100%", key="main_point_map",
+        returned_objects=["last_object_clicked_tooltip", "last_clicked"],
+    )
 
     new_point = None
     if main_map_data and main_map_data.get("last_object_clicked_tooltip"):
@@ -1850,13 +1864,31 @@ with tab_dashboard:
             .sort_values("date")  # tri chronologique (format ISO YYYY-MM-DD)
             .reset_index(drop=True)
         )
+        # Pluie sur la JOURNÉE entière (distinct du badge de l'heure retenue,
+        # qui ne reflète que le créneau précis choisi — un créneau sec peut
+        # très bien tomber un jour globalement pluvieux ailleurs).
+        if "precipitation" in df.columns:
+            rain_by_day = (
+                df.groupby("date")["precipitation"].sum().round(1)
+                .rename("pluie_jour_mm")
+            )
+            daily = daily.merge(rain_by_day, left_on="date", right_index=True, how="left")
+        else:
+            daily["pluie_jour_mm"] = None
+
         daily["date"] = pd.to_datetime(daily["date"]).dt.strftime("%d/%m")
         daily = daily.rename(columns={
             "date": "Date",
             "score": "Indice",
             "confiance": "Confiance %",
             "heure": "Meilleure heure",
+            "pluie_jour_mm": "Pluie du jour (mm)",
         })
+        st.caption(
+            "\"Pluie du jour\" = cumul sur les 24h, même si le créneau retenu "
+            "ci-dessus est sec (l'algorithme cherche la meilleure fenêtre, "
+            "pas forcément toute la journée)."
+        )
         st.dataframe(
             styled_score_table(daily, "Indice"),
             use_container_width=True,
@@ -1875,9 +1907,9 @@ with tab_dashboard:
         def _score_dot(score):
             if score is None:
                 return "⚪"
-            if score >= 65:
+            if score > 75:
                 return "🟢"
-            if score >= 40:
+            if score > 50:
                 return "🟠"
             return "🔴"
 
@@ -1905,28 +1937,17 @@ with tab_dashboard:
 
         # Seuils identiques à la pastille des boutons ci-dessus :
         # 🟢 ≥ 65, 🟠 40-65, 🔴 < 40.
-        BADGE_COLORS = {
-            "good": ("#e6f4ea", "#1b5e20"),
-            "mid": ("#fff4e5", "#8a5300"),
-            "bad": ("#fdecea", "#8a1c1c"),
-        }
-
-        def _band(score10):
-            if score10 is None:
-                return "mid"
-            if score10 >= 6.5:
-                return "good"
-            if score10 >= 4.0:
-                return "mid"
-            return "bad"
-
         def render_badges(items):
             html = '<div style="display:flex;flex-wrap:wrap;gap:8px;margin:8px 0 16px">'
             for label, score10, detail in items:
-                bg, fg = BADGE_COLORS[_band(score10)]
+                if score10 is None:
+                    bg = "background:#e0e0e0"
+                else:
+                    r, g, b = score_rgb_100(score10 * 10)
+                    bg = f"background:rgb({r},{g},{b})"
                 score_txt = f"{score10:.1f}/10" if score10 is not None else "—"
                 html += (
-                    f'<div style="background:{bg};color:{fg};border-radius:8px;'
+                    f'<div style="{bg};color:#ffffff;border-radius:8px;'
                     f'padding:8px 12px;min-width:130px;flex:1">'
                     f'<div style="font-size:11px;opacity:.85">{label}</div>'
                     f'<div style="font-size:15px;font-weight:600">{score_txt}</div>'
@@ -1958,6 +1979,15 @@ with tab_dashboard:
                 ("Pluie", best_day["rain_score"], best_day["pluie"]),
                 ("Historique", None, best_day["historique"]),
             ])
+
+            if "precipitation" in df.columns:
+                pluie_jour = df.loc[df["date"] == chosen_date, "precipitation"].sum()
+                if pluie_jour > 2 and best_day["rain_score"] >= 7:
+                    st.warning(
+                        f"⚠️ Le créneau retenu est sec, mais il pleut ailleurs "
+                        f"ce jour-là (cumul {pluie_jour:.1f} mm sur 24h). "
+                        f"Vérifie les horaires avant de partir."
+                    )
 
             st.markdown("**🌊 Pleines mers / basses mers du jour**")
             extrema_day = tides_dict.get(chosen_date, {}).get("extrema", [])
@@ -2033,7 +2063,10 @@ with tab_spots:
             icon=folium.Icon(color=color, icon=icon_name),
         ).add_to(m)
 
-    st_folium(m, height=600, width="100%", key="spots_map_readonly")
+    st_folium(
+        m, height=600, width="100%", key="spots_map_readonly",
+        returned_objects=[],
+    )
 
     spot_df = pd.DataFrame(
         [
