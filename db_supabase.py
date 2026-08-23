@@ -338,3 +338,28 @@ def fetch_with_cache(zone: str, type_: str, fetch_fn, ttl_seconds: int = 21600):
     fresh = fetch_fn()
     store_meteo_cache(zone, type_, fresh, ttl_seconds)
     return fresh
+
+
+# -----------------------------
+# Zones SHOM permanentes (table shom_zones, remplie une fois via le
+# script upload_shom_zones.py) — permet à l'appli de choisir
+# automatiquement la bonne zone selon le spot analysé, sans upload
+# manuel à chaque session.
+# -----------------------------
+def get_shom_zones_for_point(lat: float, lon: float) -> list[dict]:
+    """Renvoie les zones SHOM (déjà envoyées via upload_shom_zones.py)
+    dont la boîte englobante contient le point donné. Peut renvoyer
+    plusieurs zones si elles se chevauchent (rare : le SHOM retire déjà
+    les recouvrements entre fichiers d'une même livraison)."""
+    client = get_client()
+    res = (
+        client.table("shom_zones")
+        .select("zone_name,dossier,port_reference,reference,data,row_count")
+        .lte("lat_min", lat)
+        .gte("lat_max", lat)
+        .lte("lon_min", lon)
+        .gte("lon_max", lon)
+        .execute()
+    )
+    return res.data or []
+

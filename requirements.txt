@@ -1,8 +1,9 @@
 streamlit
 requests
 pandas
+numpy
 streamlit-folium
 folium
 xarray
 supabase
-matplotlib
+plotly

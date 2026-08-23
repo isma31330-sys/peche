@@ -12,6 +12,8 @@ import zipfile
 from urllib.parse import quote
 from streamlit_folium import st_folium
 import folium
+import numpy as np
+import plotly.graph_objects as go
 try:
     import xarray as xr
 except Exception:
@@ -783,52 +785,92 @@ def score_confidence(days_ahead, data_flags, hist_conf, marine_available):
     return int(round(max(25, min(95, raw * 100))))
 
 
+BAR_TECHNIQUE_PROFILE = {
+    "Surface": {
+        "depth": "surface",
+        "channel": "vue (silhouette, sillage)",
+        "speed": "vive, pauses marquées",
+    },
+    "Métal": {
+        "depth": "pleine eau à fond, prospection large",
+        "channel": "flash + vibration",
+        "speed": "rapide, ramené linéaire ou saccadé",
+    },
+    "Jerkbait / minnow": {
+        "depth": "sub-surface (20–60 cm)",
+        "channel": "imitation visuelle + rolling",
+        "speed": "lente à modérée, tirées-pauses",
+    },
+    "Leurre souple": {
+        "depth": "mi-eau à fond, suit la dérive",
+        "channel": "vibration de caudale (ligne latérale)",
+        "speed": "adaptée au courant, animation près du fond",
+    },
+}
+DAURADE_TECHNIQUE_PROFILE = {
+    "Crabe au posé": {
+        "appat": "crabe vert (dur ou mou)",
+        "montage": "coulissant 50–80 g, fluoro 40–45/100, bas de ligne 1–1,5 m, hameçon fort n°1–2",
+        "note": "très sélectif, cible plutôt les belles pièces",
+    },
+    "Couteau / coquillage": {
+        "appat": "couteau ou coquillage décortiqué",
+        "montage": "coulissant 50–80 g",
+        "note": "efficace sur fonds sableux, post-marée",
+    },
+    "Ver": {
+        "appat": "ver marin (arénicole/américain)",
+        "montage": "coulissant léger à moyen",
+        "note": "plus universel, davantage de touches mais moins sélectif",
+    },
+    "Surfcasting": {
+        "appat": "appât naturel au choix selon le fond",
+        "montage": "coulissant léger, 60–90 g selon courant",
+        "note": "prospection large en battant l'estran",
+    },
+}
+
+
 def recommendation_for(species, technique, score, row, spot):
-    """Recommandation dynamique : la couleur/présentation varie avec la
-    turbidité estimée (eau claire → discret/naturel, eau trouble → vibrant/
-    voyant, s'appuie sur la ligne latérale), et l'animation varie avec la
-    température de l'eau (froide → lente, éviter la surface sous ~14°C pour
-    le bar). Sources : voir recherche_criteres_peche.md.
+    """Recommandation dynamique : la couleur/canal sensoriel privilégié varie
+    avec la turbidité estimée (eau claire → discret/visuel, eau trouble →
+    vibrant/voyant, s'appuie sur la ligne latérale), et l'animation varie
+    avec la température de l'eau (froide → lente, éviter la surface sous
+    ~14°C pour le bar). Chaque technique a un profil propre (profondeur,
+    canal sensoriel, vitesse) pour que la recommandation principale et son
+    alternative restent réellement différenciées plutôt que de simples
+    reformulations l'une de l'autre. Sources : voir recherche_criteres_peche.md.
     """
     turb = row.get("turbidity_idx") if hasattr(row, "get") else None
     sst = row.get("water_temp_c") if hasattr(row, "get") else None
     cold_water = sst is not None and sst < 14
 
-    if turb is not None and turb >= 6:
-        couleur = "coloris vif (chartreuse, blanc, UV) — eau trouble, le poisson compte sur sa ligne latérale plus que sur la vue"
-    elif turb is not None and turb <= 2:
-        couleur = "coloris naturel/translucide — eau claire, reste discret"
-    else:
-        couleur = "coloris intermédiaire, reflets naturels"
-
     if species == "Bar":
-        if technique == "Surface":
-            if cold_water:
-                lure = (
-                    f"Eau <14°C : la surface devient peu productive (le bar évolue plus "
-                    f"profond) — bascule sur un poisson nageur ou un leurre souple, "
-                    f"{couleur}, animation lente."
-                )
-            else:
-                lure = f"Surface 10–20 g, {couleur} ; privilégier aube ou crépuscule."
-        elif technique == "Métal":
-            lure = f"Casting jig 20–40 g si vent/courant et poissons fourrage présents, {couleur}."
-        elif technique == "Jerkbait / minnow":
-            anim = "lente" if cold_water else "lente à modérée"
-            lure = f"Minnow 12–18 cm, {couleur}, récupération {anim} près des cassures."
+        profile = BAR_TECHNIQUE_PROFILE.get(technique, BAR_TECHNIQUE_PROFILE["Leurre souple"])
+
+        if cold_water and technique == "Surface":
+            return (
+                "Eau <14°C : la surface devient peu productive (le bar évolue "
+                "plus profond) — bascule sur un poisson nageur ou un leurre "
+                "souple en mi-eau, animation lente."
+            )
+
+        speed = f"{profile['speed']}, ralentie (eau froide)" if cold_water else profile["speed"]
+
+        if turb is not None and turb >= 6:
+            couleur = f"coloris vif (chartreuse, blanc, UV) — mise sur {profile['channel']}"
+        elif turb is not None and turb <= 2:
+            couleur = f"coloris naturel/translucide, joue sur {profile['channel']}"
         else:
-            anim = "lente, tête plombée légère" if cold_water else "adaptée au courant"
-            lure = f"Leurre souple 20–30 g, {couleur} ; animation {anim}, lancer en travers puis suivre la dérive."
-        return lure
+            couleur = f"coloris intermédiaire, {profile['channel']}"
+
+        return (
+            f"{technique} — évolue en {profile['depth']} ; {couleur} ; "
+            f"animation {speed}."
+        )
     else:
-        if technique == "Crabe au posé":
-            base = "Crabe vert, montage coulissant 50–80 g, fluoro 40–45/100, bas de ligne 1–1,5 m, hameçon fort n°1–2."
-        elif technique == "Couteau / coquillage":
-            base = "Couteau/coquillage sur montage coulissant, 50–80 g ; privilégier les bordures de courant et fonds coquilliers."
-        elif technique == "Ver":
-            base = "Ver marin sur montage coulissant léger à moyen ; intéressant lorsque le courant est modéré."
-        else:
-            base = "Surfcasting léger : 60–90 g selon courant, bas de ligne 40–45/100, appât naturel."
+        profile = DAURADE_TECHNIQUE_PROFILE.get(technique, DAURADE_TECHNIQUE_PROFILE["Surfcasting"])
+        base = f"{profile['appat']}, montage {profile['montage']} — {profile['note']}."
 
         if turb is not None and turb <= 2:
             base += " Eau claire : affine le bas de ligne (22/100) et reste discret, la daurade est méfiante."
@@ -866,98 +908,170 @@ def _find_var_name(ds, candidates):
     return None
 
 
-def _read_shom_txt_bytes(raw, filename="courants.txt"):
-    """Lecture tolérante des TXT SHOM Courants 2D.
+KNOT_TO_MS = 0.5144447
 
-    Le produit officiel actuellement publié par le SHOM est en TXT ASCII/WGS84.
-    Les fichiers contiennent des points de courant et des échéances relatives à
-    PM/BM. Comme les vues peuvent avoir des structures de colonnes différentes,
-    on privilégie les noms de colonnes lorsqu'ils sont présents et on refuse de
-    deviner silencieusement une structure ambiguë.
+
+def _parse_shom_position(token):
+    """Convertit un jeton de coordonnée SHOM (format sDDMM.mmm pour la
+    latitude, sDDDMM.mmm pour la longitude) en degrés décimaux. Les 2
+    derniers chiffres avant le point décimal sont toujours les minutes, le
+    reste les degrés — valable aussi bien pour la latitude (2 chiffres de
+    degrés) que la longitude (jusqu'à 3 chiffres), sans distinction requise.
     """
-    # Détection encodage simple
-    txt = raw.decode("utf-8", errors="replace")
-    lines = txt.splitlines()
-    nonempty = [x.strip() for x in lines if x.strip() and not x.lstrip().startswith("#")]
-    if not nonempty:
-        raise ValueError("Fichier TXT vide.")
-
-    # Plusieurs séparateurs possibles dans les exports ASCII SHOM.
-    candidates = [r"\\s+", r"[;\\t]+", r"[,;\\t]+"]
-    best = None
-    for sep in candidates:
-        try:
-            df = pd.read_csv(BytesIO(raw), sep=sep, engine="python", comment="#")
-            if df.shape[1] >= 4:
-                best = df
-                break
-        except Exception:
-            pass
-
-    if best is None:
-        # Dernier essai sans en-tête : on ne garde que les lignes numériques.
-        rows = []
-        for line in nonempty:
-            parts = re.split(r"[;\\s,]+", line)
-            nums = []
-            for x in parts:
-                try:
-                    nums.append(float(x.replace(',', '.')))
-                except Exception:
-                    pass
-            if len(nums) >= 4:
-                rows.append(nums)
-        if not rows:
-            raise ValueError("Aucune ligne numérique exploitable trouvée dans le TXT SHOM.")
-        width = max(len(r) for r in rows)
-        best = pd.DataFrame([r + [float('nan')] * (width-len(r)) for r in rows])
-
-    best.columns = [str(c).strip().lower() for c in best.columns]
-    return best
-
-
-def _normalise_shom_columns(df):
-    """Normalise un tableau SHOM vers lat/lon/u/v/offset_h/coefficient."""
-    cols = list(df.columns)
-    def pick(words):
-        for w in words:
-            for c in cols:
-                if w == c or w in c:
-                    return c
+    token = token.strip()
+    if not token or "." not in token:
         return None
+    sign = 1.0
+    if token[0] == "-":
+        sign = -1.0
+        token = token[1:]
+    elif token[0] == "+":
+        token = token[1:]
+    whole, frac = token.split(".", 1)
+    if len(whole) < 2:
+        return None
+    try:
+        minutes = float(whole[-2:] + "." + frac)
+        degrees = float(whole[:-2]) if whole[:-2] else 0.0
+    except ValueError:
+        return None
+    return sign * (degrees + minutes / 60.0)
 
-    lat = pick(["latitude", "lat", "y"])
-    lon = pick(["longitude", "lon", "long", "x"])
-    u = pick(["u", "courant_u", "eastward", "est"])
-    v = pick(["v", "courant_v", "northward", "nord"])
-    offset = pick(["offset_h", "delta_h", "heure", "hour", "time_h", "echeance"])
-    coeff = pick(["coefficient", "coeff", "coef"])
-    phase = pick(["phase", "reference", "pm_bm", "type"])
 
-    # Les exports peuvent ne pas nommer U/V. On ne fait pas de déduction
-    # silencieuse à partir de colonnes numériques : mieux vaut demander un
-    # format identifiable que calculer un courant faux.
-    if not all([lat, lon, u, v]):
+def _align_shom_field_block(segment, strip_side):
+    """Ramène un bloc de valeurs à un multiple de 3 caractères en ne
+    retirant que de VRAIS espaces du côté attendu (bordure du séparateur
+    '*'). Le nombre d'espaces autour du '*' varie ligne à ligne dans les
+    fichiers réels — il n'y en a parfois aucun, parfois un — selon que la
+    valeur adjacente a elle-même besoin d'un espace de remplissage dans
+    son propre champ de 3 caractères. Un simple rstrip()/lstrip() retire
+    parfois à tort un espace qui appartient à une valeur, décalant tout le
+    reste du découpage. Confirmé caractère par caractère sur des fichiers
+    SHOM réels (aucun échec sur 557/BOULOGNE, CALAIS, DUNKERQUE, PAS_DE_CALAIS).
+    """
+    while len(segment) % 3 != 0 and segment and (
+        (segment[-1] == " ") if strip_side == "right" else (segment[0] == " ")
+    ):
+        segment = segment[:-1] if strip_side == "right" else segment[1:]
+    return segment if len(segment) % 3 == 0 else None
+
+
+def _chunk_shom_values(segment):
+    """Découpe une chaîne en blocs fixes de 3 caractères (format officiel
+    SHOM confirmé sur données réelles : chaque valeur, en dixièmes de
+    nœud, occupe exactement 3 caractères, signe compris — le blanc n'est
+    PAS un séparateur, contrairement à un format tabulaire classique).
+    Retourne None si le découpage n'est pas net (protection contre un
+    fichier qui ne suivrait pas ce format).
+    """
+    if len(segment) % 3 != 0:
+        return None
+    vals = []
+    for i in range(0, len(segment), 3):
+        piece = segment[i:i + 3].strip()
+        if piece in ("", "-"):
+            vals.append(None)
+            continue
+        try:
+            vals.append(int(piece))
+        except ValueError:
+            return None
+    return vals
+
+
+def _parse_shom_txt_official(raw, filename="courants.txt"):
+    """Lit le format officiel SHOM 'Courants de marée des côtes de France'
+    (documenté dans le _lisezmoi.txt du CD-ROM, confirmé caractère par
+    caractère sur des fichiers réels) :
+    - en-tête : nom du port de référence (suffixe .BM si basse mer, sinon
+      pleine mer implicite) ;
+    - puis des triplets de 3 lignes par point : position WGS84, courants
+      de vive-eau (coefficient 95), courants de morte-eau (coefficient 45) ;
+    - 13 échéances de -6h à +6h par rapport à la PM/BM, EN DIXIÈMES DE
+      NŒUD (converties ici en m/s — l'ancien code les traitait à tort
+      comme des m/s bruts, soit un facteur ~19 d'erreur).
+    Ce N'EST PAS un tableau colonnes/lignes classique : impossible à lire
+    avec un simple séparateur, d'où cette lecture positionnelle dédiée.
+    """
+    text = raw.decode("latin-1", errors="replace")
+    raw_lines = [l.rstrip("\r").rstrip("\t") for l in text.splitlines()]
+    lines = [l for l in raw_lines if l.strip() != ""]
+    if not lines:
+        raise ValueError("Fichier SHOM vide.")
+
+    header = lines[0].strip()
+    reference = "PM"
+    port = header
+    if port.upper().endswith(".BM"):
+        reference = "BM"
+        port = port[:-3].strip()
+
+    hours = list(range(-6, 7))
+    rows = []
+    i = 1
+    n = len(lines)
+    while i + 2 < n:
+        parts = lines[i].split()
+        if len(parts) < 2:
+            i += 1
+            continue
+        lat = _parse_shom_position(parts[0])
+        lon = _parse_shom_position(parts[1])
+        if lat is None or lon is None:
+            i += 1
+            continue
+
+        ok = True
+        point_rows = []
+        for coef, line in ((95, lines[i + 1]), (45, lines[i + 2])):
+            if "*" not in line:
+                ok = False
+                break
+            we_part, ns_part = line.split("*", 1)
+            we_aligned = _align_shom_field_block(we_part, "right")
+            ns_aligned = _align_shom_field_block(ns_part, "left")
+            if we_aligned is None or ns_aligned is None:
+                ok = False
+                break
+            we_vals = _chunk_shom_values(we_aligned)
+            ns_vals = _chunk_shom_values(ns_aligned)
+            if we_vals is None or ns_vals is None or len(we_vals) != 13 or len(ns_vals) != 13:
+                ok = False
+                break
+            for h, u_raw, v_raw in zip(hours, we_vals, ns_vals):
+                if u_raw is None or v_raw is None:
+                    continue
+                point_rows.append({
+                    "lat": lat, "lon": lon, "offset_h": h, "coefficient": coef,
+                    "u": (u_raw / 10.0) * KNOT_TO_MS,
+                    "v": (v_raw / 10.0) * KNOT_TO_MS,
+                })
+        if ok:
+            rows.extend(point_rows)
+        i += 3
+
+    if not rows:
         raise ValueError(
-            "Colonnes SHOM non reconnues. Le fichier doit permettre d'identifier "
-            "latitude, longitude, U et V. Ouvre le TXT et vérifie son en-tête."
+            "Aucun point exploitable — le fichier ne correspond pas au format "
+            "officiel SHOM (en-tête = port, puis triplets position / "
+            "vive-eau / morte-eau)."
         )
 
-    out = pd.DataFrame({
-        "lat": pd.to_numeric(df[lat], errors="coerce"),
-        "lon": pd.to_numeric(df[lon], errors="coerce"),
-        "u": pd.to_numeric(df[u], errors="coerce"),
-        "v": pd.to_numeric(df[v], errors="coerce"),
-    })
-    out["offset_h"] = pd.to_numeric(df[offset], errors="coerce") if offset else float("nan")
-    out["coefficient"] = pd.to_numeric(df[coeff], errors="coerce") if coeff else float("nan")
-    out["phase"] = df[phase].astype(str) if phase else ""
-    out = out.dropna(subset=["lat", "lon", "u", "v"]).copy()
-    return out
+    df = pd.DataFrame(rows)
+    df["phase"] = reference
+    df["source_file"] = filename
+    df["port_reference"] = port
+    return df
 
 
 def load_shom_dataset(uploaded_file):
-    """Charge soit le NetCDF 2D, soit le TXT/ZIP du produit SHOM."""
+    """Charge soit le NetCDF 2D, soit le TXT/ZIP du produit SHOM.
+
+    Les fichiers officiels SHOM (ex. CALAIS_557, BOULOGNE_557) n'ont AUCUNE
+    extension — on ne filtre donc plus sur ".txt" dans un ZIP : on tente le
+    parseur officiel sur chaque membre et on ignore silencieusement ceux qui
+    échouent (fichiers d'aide _lisezmoi*, .ico, .rtf...).
+    """
     if uploaded_file is None:
         return None, None
     raw = uploaded_file.getvalue()
@@ -972,34 +1086,36 @@ def load_shom_dataset(uploaded_file):
         except Exception as e:
             return None, str(e)
 
-    # ZIP : le produit de téléchargement peut contenir plusieurs TXT de vues.
+    # ZIP : le dossier SHOM complet (fichiers de données sans extension +
+    # fichiers d'aide _lisezmoi*.txt à ignorer).
     if name.endswith(".zip"):
         try:
             z = zipfile.ZipFile(BytesIO(raw))
             frames = []
             for info in z.infolist():
-                if info.is_dir() or not info.filename.lower().endswith(".txt"):
+                if info.is_dir():
+                    continue
+                base = info.filename.rsplit("/", 1)[-1]
+                if base.lower().startswith("_lisezmoi") or base.lower().endswith((".ico", ".rtf", ".gif")):
                     continue
                 try:
-                    d = _normalise_shom_columns(_read_shom_txt_bytes(z.read(info), info.filename))
-                    d["source_file"] = info.filename
+                    d = _parse_shom_txt_official(z.read(info), base)
                     frames.append(d)
                 except Exception:
                     continue
             if not frames:
-                raise ValueError("Aucun TXT SHOM exploitable trouvé dans le ZIP.")
+                raise ValueError("Aucun fichier SHOM exploitable trouvé dans le ZIP.")
             return {"kind": "txt", "data": pd.concat(frames, ignore_index=True)}, None
         except Exception as e:
             return None, str(e)
 
-    if name.endswith(".txt"):
-        try:
-            df = _normalise_shom_columns(_read_shom_txt_bytes(raw, name))
-            return {"kind": "txt", "data": df}, None
-        except Exception as e:
-            return None, str(e)
-
-    return None, "Format SHOM attendu : .txt, .zip ou .nc/.nc4."
+    # TXT nommé explicitement, ou fichier de données SHOM sans extension
+    # (cas normal pour un fichier téléchargé individuellement).
+    try:
+        df = _parse_shom_txt_official(raw, uploaded_file.name)
+        return {"kind": "txt", "data": df}, None
+    except Exception as e:
+        return None, str(e)
 
 
 def shom_current_at(ds, lat, lon, dt, tide_info, reference="PM"):
@@ -1037,7 +1153,7 @@ def shom_current_at(ds, lat, lon, dt, tide_info, reference="PM"):
     candidates = []
     for e in extrema:
         try:
-            et = pd.Timestamp(e["datetime"])
+            et = pd.Timestamp(e["time"])
             typ = str(e.get("type", "")).upper()
             if reference == "PM" and "PM" not in typ:
                 continue
@@ -1136,7 +1252,7 @@ def shom_current_txt(df, lat, lon, dt, tide_info, reference="PM"):
     candidates=[]
     for e in extrema:
         try:
-            et=pd.Timestamp(e["datetime"]); typ=str(e.get("type","")).upper()
+            et=pd.Timestamp(e["time"]); typ=str(e.get("type","")).upper()
             if reference == "PM" and "PM" not in typ: continue
             if reference == "BM" and "BM" not in typ: continue
             dh=(_to_paris_aware(dt)-_to_paris_aware(et)).total_seconds()/3600
@@ -1193,7 +1309,149 @@ def current_score_value(speed_ms, species):
     return 3.0
 
 
-def _extrema_window(tides_dict, date_key):
+def shom_field_at_hour(shom_ds, tides_dict, date_key, hour_int, reference, lat_center, lon_center, radius_km=15.0):
+    """Champ de courant 2D (tous les points SHOM proches du spot) pour une
+    heure donnée d'un jour donné. Contrairement à shom_current_txt() qui ne
+    donne qu'UN point, ceci reconstruit la grille entière pour la carte
+    animée : pour chaque point, on sélectionne l'échéance (offset_h) la plus
+    proche de l'heure demandée séparément pour les situations coefficient 45
+    et 95, puis on interpole entre les deux comme pour le score.
+    Ne fonctionne qu'avec le format TXT/ZIP (pas encore le NetCDF).
+    """
+    if not (isinstance(shom_ds, dict) and shom_ds.get("kind") == "txt"):
+        return None, "Visualisation disponible uniquement pour le format TXT/ZIP pour l'instant."
+
+    df_pts = shom_ds["data"]
+    if df_pts.empty or df_pts["coefficient"].isna().all():
+        return None, "Le fichier ne contient pas de colonne coefficient exploitable."
+
+    extrema = _extrema_window(tides_dict, date_key)
+    tide_info = tides_dict.get(date_key, {})
+    if not extrema:
+        return None, "Pas de données de marée pour ce jour (nécessaires pour situer l'échéance PM/BM)."
+    coef = safe_float(tide_info.get("max_coef"), 70)
+
+    dt = _to_paris_aware(pd.Timestamp(f"{date_key} {hour_int:02d}:00:00"))
+    candidates = []
+    for e in extrema:
+        et = parse_extreme_datetime(e)
+        if et is None:
+            continue
+        typ = str(e.get("type", "")).upper()
+        if reference == "PM" and "PM" not in typ:
+            continue
+        if reference == "BM" and "BM" not in typ:
+            continue
+        dh = (dt - et).total_seconds() / 3600.0
+        if -6.01 <= dh <= 6.01:
+            candidates.append((abs(dh), dh))
+    if not candidates:
+        return None, f"Aucune échéance PM/BM ({reference}) à ±6h de {hour_int:02d}:00 ce jour-là."
+    _, dh = min(candidates)
+
+    def nearest_offset_subset(coeff_val):
+        sub = df_pts[df_pts["coefficient"].sub(coeff_val).abs() < 1e-6]
+        if sub.empty:
+            return sub
+        if sub["offset_h"].notna().any():
+            available = sub["offset_h"].dropna().unique()
+            nearest_off = min(available, key=lambda o: abs(o - dh))
+            sub = sub[sub["offset_h"].sub(nearest_off).abs() < 1e-6]
+        return sub
+
+    d45 = nearest_offset_subset(45.0)
+    d95 = nearest_offset_subset(95.0)
+    if d45.empty or d95.empty:
+        return None, "Situations coefficient 45/95 introuvables dans le fichier pour cette échéance."
+
+    merged = d45.merge(d95, on=["lat", "lon"], suffixes=("_45", "_95"), how="inner")
+    if merged.empty:
+        return None, "Grilles 45 et 95 non superposables (points non alignés)."
+
+    target = max(45.0, min(95.0, float(coef)))
+    alpha = (target - 45.0) / 50.0
+    merged["u"] = merged["u_45"] + alpha * (merged["u_95"] - merged["u_45"])
+    merged["v"] = merged["v_45"] + alpha * (merged["v_95"] - merged["v_45"])
+
+    merged["dist_km"] = merged.apply(
+        lambda r: haversine(lat_center, lon_center, r["lat"], r["lon"]), axis=1
+    )
+    merged = merged[merged["dist_km"] <= radius_km]
+    if merged.empty:
+        return None, f"Aucun point SHOM à moins de {radius_km:.0f} km du spot."
+
+    merged["speed_kn"] = np.hypot(merged["u"], merged["v"]) * 1.943844
+    merged["direction"] = (np.degrees(np.arctan2(merged["u"], merged["v"])) + 360) % 360
+    return merged[["lat", "lon", "u", "v", "speed_kn", "direction"]].reset_index(drop=True), None
+
+
+def build_current_arrows_figure(hourly_fields, hours, center_lat, center_lon, arrow_scale=0.006):
+    """Construit une figure Plotly (fond OpenStreetMap, pas de clé requise)
+    avec une flèche par point de grille et une frame par heure, pour le
+    lecteur d'animation (play/pause + curseur) de l'onglet SHOM.
+    """
+    def frame_traces(field_df):
+        if field_df is None or field_df.empty:
+            return [go.Scattermapbox(lat=[], lon=[], mode="lines"),
+                    go.Scattermapbox(lat=[], lon=[], mode="markers")]
+        lats, lons = [], []
+        for _, r in field_df.iterrows():
+            length = r["speed_kn"] * arrow_scale
+            rad = math.radians(r["direction"])
+            dlat = length * math.cos(rad)
+            dlon = length * math.sin(rad) / max(0.2, math.cos(math.radians(r["lat"])))
+            lats += [r["lat"], r["lat"] + dlat, None]
+            lons += [r["lon"], r["lon"] + dlon, None]
+        line_trace = go.Scattermapbox(
+            lat=lats, lon=lons, mode="lines",
+            line=dict(width=2, color="#1565c0"),
+            hoverinfo="skip", showlegend=False,
+        )
+        tip_trace = go.Scattermapbox(
+            lat=field_df["lat"] + field_df["speed_kn"] * arrow_scale * np.cos(np.radians(field_df["direction"])),
+            lon=field_df["lon"] + field_df["speed_kn"] * arrow_scale * np.sin(np.radians(field_df["direction"])) / max(0.2, math.cos(math.radians(center_lat))),
+            mode="markers",
+            marker=dict(size=7, color=field_df["speed_kn"], colorscale="Turbo", cmin=0, cmax=3,
+                        colorbar=dict(title="nd")),
+            text=[f"{s:.2f} nd · {d:.0f}°" for s, d in zip(field_df["speed_kn"], field_df["direction"])],
+            hoverinfo="text", showlegend=False,
+        )
+        return [line_trace, tip_trace]
+
+    first_field = hourly_fields.get(hours[0])
+    init_traces = frame_traces(first_field)
+
+    frames = [
+        go.Frame(data=frame_traces(hourly_fields.get(h)), name=f"{h:02d}h")
+        for h in hours
+    ]
+
+    fig = go.Figure(data=init_traces, frames=frames)
+    fig.update_layout(
+        mapbox=dict(style="open-street-map", center=dict(lat=center_lat, lon=center_lon), zoom=10.5),
+        margin=dict(l=0, r=0, t=0, b=0),
+        height=520,
+        updatemenus=[dict(
+            type="buttons", showactive=False, x=0.02, y=0.02, xanchor="left", yanchor="bottom",
+            buttons=[
+                dict(label="▶️ Lecture", method="animate",
+                     args=[None, {"frame": {"duration": 450, "redraw": True}, "fromcurrent": True, "mode": "immediate"}]),
+                dict(label="⏸️ Pause", method="animate",
+                     args=[[None], {"frame": {"duration": 0, "redraw": False}, "mode": "immediate"}]),
+            ],
+        )],
+        sliders=[dict(
+            active=0,
+            currentvalue={"prefix": "Heure : "},
+            steps=[dict(label=f"{h:02d}h", method="animate",
+                        args=[[f"{h:02d}h"], {"frame": {"duration": 0, "redraw": True}, "mode": "immediate"}])
+                   for h in hours],
+        )],
+    )
+    return fig
+
+
+
     """Concatène les extrema de la veille, du jour et du lendemain, pour
     permettre à tide_phase_score()/shom_current_at() d'encadrer correctement
     les heures proches de minuit (continuité entre jours au lieu de se
@@ -1671,9 +1929,15 @@ with st.sidebar:
         help="Le produit SHOM encode les échéances autour de la PM ou BM du port de référence de la grille."
     )
     shom_file = st.file_uploader(
-        "Importer le paquet SHOM Courants 2D (.zip/.txt/.nc)",
-        type=["zip", "txt", "nc", "nc4"],
-        help="Le produit officiel Courants 2D est diffusé gratuitement sous Licence Ouverte. Le produit actuellement publié est en TXT/WGS84 ; la variante NetCDF est aussi documentée par le SHOM."
+        "Importer les données SHOM Courants 2D",
+        type=None,
+        help=(
+            "Le plus simple : zippe tout le dossier téléchargé (ex. le "
+            "dossier '558' pour Bretagne Sud) et importe le .zip — les "
+            "fichiers de données SHOM n'ont pas d'extension (ex. "
+            "'BRETAGNE_SUD_558'), d'où l'acceptation de tout type de "
+            "fichier ici. TXT unique ou NetCDF (.nc) également acceptés."
+        ),
     )
 
 def _load_shom_with_shared_cache(uploaded_file, zone, reference):
@@ -1706,14 +1970,49 @@ def _load_shom_with_shared_cache(uploaded_file, zone, reference):
     return {"kind": "txt", "data": pd.DataFrame(cached["records"])}, None
 
 
-# Chargement du fichier SHOM (si fourni), via le cache partagé Supabase.
-shom_ds, shom_error = _load_shom_with_shared_cache(shom_file, ZONE, shom_reference)
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def _load_shom_from_supabase_zones(lat, lon):
+    """Charge automatiquement les zones SHOM (déjà envoyées une fois via
+    upload_shom_zones.py) couvrant le point donné — pas d'upload manuel
+    nécessaire. Retourne (shom_ds, zones_utilisées) ; zones_utilisées est
+    une liste de noms pour affichage, vide si rien trouvé pour ce point.
+    """
+    try:
+        zones = db.get_shom_zones_for_point(round(lat, 3), round(lon, 3))
+    except Exception:
+        return None, []
+    if not zones:
+        return None, []
+    all_rows = []
+    for z in zones:
+        all_rows.extend(z.get("data") or [])
+    if not all_rows:
+        return None, []
+    return {"kind": "txt", "data": pd.DataFrame(all_rows)}, [z["zone_name"] for z in zones]
+
+
+# Chargement du fichier SHOM : upload manuel prioritaire s'il est fourni,
+# sinon sélection automatique dans Supabase selon le spot analysé (table
+# shom_zones, remplie une fois via upload_shom_zones.py).
+shom_zone_names = []
+if shom_file is not None:
+    shom_ds, shom_error = _load_shom_with_shared_cache(shom_file, ZONE, shom_reference)
+else:
+    shom_ds, shom_zone_names = _load_shom_from_supabase_zones(spot["lat"], spot["lon"])
+    shom_error = None
+
 if shom_error:
     st.sidebar.error(f"Fichier SHOM illisible : {shom_error}")
+elif shom_ds is not None and shom_zone_names:
+    st.sidebar.success(f"✅ Courants SHOM (Supabase, zone {', '.join(shom_zone_names)})")
 elif shom_ds is not None:
     st.sidebar.success("✅ Courants SHOM chargés (cache partagé) : utilisés dans le score horaire")
 else:
-    st.sidebar.caption("Courants SHOM : importer le paquet TXT/ZIP (ou NetCDF si disponible) pour activer le calcul local.")
+    st.sidebar.caption(
+        "Courants SHOM : aucune zone Supabase pour ce point — "
+        "importer le paquet TXT/ZIP manuellement, ou lancer "
+        "upload_shom_zones.py pour cette zone."
+    )
 
 # La météo est toujours interrogée au point exact du secteur analysé
 # (spot connu ou point cliqué librement) — plus de cellule de référence
@@ -2184,17 +2483,21 @@ with tab_dashboard:
             st.info(f"**{technique}** — {reco_principale}")
 
             st.markdown("#### 🔄 Alternative si ça ne mord pas")
+            # Alternative choisie pour être réellement à l'opposé de la
+            # technique principale (profondeur/canal sensoriel pour le bar,
+            # sélectivité de l'appât pour la daurade) plutôt qu'une simple
+            # variante voisine.
             ALT_TECHNIQUE = {
                 "Bar": {
-                    "Surface": "Jerkbait / minnow",
-                    "Métal": "Leurre souple",
-                    "Jerkbait / minnow": "Métal",
-                    "Leurre souple": "Jerkbait / minnow",
+                    "Surface": "Leurre souple",       # vue/surface -> vibration/fond
+                    "Leurre souple": "Surface",         # fond/vibration -> vue/surface
+                    "Métal": "Jerkbait / minnow",       # rapide/flash -> lent/imitatif
+                    "Jerkbait / minnow": "Métal",       # lent/imitatif -> rapide/flash
                 },
                 "Daurade royale": {
-                    "Crabe au posé": "Couteau / coquillage",
-                    "Couteau / coquillage": "Ver",
-                    "Ver": "Crabe au posé",
+                    "Crabe au posé": "Ver",             # très sélectif -> universel
+                    "Ver": "Crabe au posé",             # universel -> très sélectif
+                    "Couteau / coquillage": "Crabe au posé",
                 },
             }
             default_alt = {"Bar": "Leurre souple", "Daurade royale": "Crabe au posé"}
@@ -2349,6 +2652,51 @@ with tab_shom:
                 st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
             else:
                 st.warning("Aucune valeur SHOM exploitable pour les créneaux affichés. Vérifie PM/BM et la zone couverte par le fichier.")
+
+        # --- Visualisation dynamique : flèches de courant heure par heure ---
+        st.markdown("### 🧭 Visualisation dynamique du courant")
+        if not (isinstance(shom_ds, dict) and shom_ds.get("kind") == "txt"):
+            st.info("Cette visualisation n'est disponible que pour le format TXT/ZIP (pas encore le NetCDF).")
+        else:
+            available_dates = sorted(tides_dict.keys()) if tides_dict else []
+            if not available_dates:
+                st.info("Pas de données de marée disponibles pour situer les échéances du jour.")
+            else:
+                viz_date = st.selectbox("Jour à visualiser", available_dates, key="shom_viz_date")
+                radius_km = st.slider("Rayon autour du spot (km)", 2, 40, 15, key="shom_viz_radius")
+
+                with st.spinner("Calcul du champ de courant heure par heure..."):
+                    hours = list(range(24))
+                    hourly_fields = {}
+                    last_err = None
+                    for h in hours:
+                        field, err = shom_field_at_hour(
+                            shom_ds, tides_dict, viz_date, h, shom_reference,
+                            spot["lat"], spot["lon"], radius_km=radius_km,
+                        )
+                        hourly_fields[h] = field
+                        if err:
+                            last_err = err
+
+                if all(f is None for f in hourly_fields.values()):
+                    st.warning(
+                        "Aucune heure exploitable pour ce jour/rayon. "
+                        + (f"Détail : {last_err}" if last_err else "")
+                    )
+                else:
+                    n_ok = sum(1 for f in hourly_fields.values() if f is not None)
+                    st.caption(
+                        f"{n_ok}/24 heures avec un champ de courant calculable dans un rayon de {radius_km} km. "
+                        "Clique ▶️ Lecture pour l'animation (défile 1x sur la journée), "
+                        "ou utilise le curseur pour naviguer heure par heure."
+                    )
+                    fig = build_current_arrows_figure(hourly_fields, hours, spot["lat"], spot["lon"])
+                    st.plotly_chart(fig, use_container_width=True)
+                    st.caption(
+                        "⚠️ Limite connue : le bouton Lecture de Plotly joue la séquence une fois "
+                        "puis s'arrête sur la dernière heure — reclique pour rejouer. Une boucle "
+                        "continue nécessiterait un composant JS dédié, hors de portée simple ici."
+                    )
 
 # ============================================================
 # TAB 3 : carnet de sessions
