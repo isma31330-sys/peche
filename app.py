@@ -212,7 +212,7 @@ SPECIES = {
             "Surface",
             "Métal",
         ],
-        # poids : marée/courant/vent/houle/lumière/eau/pression/historique
+        # poids : marée/courant/vent/houle/lumière/eau/pression/historique/pluie
         "weights": {
             "maree": 0.17,
             "courant": 0.18,
@@ -453,12 +453,41 @@ def light_score(dt_local, cloud, species):
             base = 6.5
 
     if cloud is not None:
-        if 20 <= cloud <= 70:
-            base += 0.5
+        if 20 <= cloud <= 75:
+            # Couvert léger à modéré : lumière diffuse, souvent plus
+            # favorable qu'un grand soleil (moins de méfiance du poisson).
+            base += 0.6
+        elif cloud < 15:
+            # Ciel bien dégagé / grand soleil : lumière crue.
+            base -= 0.4
         elif cloud > 90:
             base -= 0.3
 
     return clamp(base), "Transition lumineuse" if transition else "Lumière standard"
+
+
+def rain_penalty(precip_mm):
+    """Facteur MULTIPLICATIF appliqué au score final (pas une simple
+    moyenne pondérée) : la pluie est un critère quasi rédhibitoire —
+    diluée dans une moyenne avec 8-9 autres facteurs, elle perdrait
+    trop d'impact même sous forte pluie. Ici, un temps pluvieux tire le
+    score final vers le bas quelle que soit la qualité des autres
+    conditions.
+    """
+    if precip_mm is None:
+        return 1.0, "Pluie indisponible"
+
+    p = float(precip_mm)
+    if p <= 0.05:
+        return 1.0, "Temps sec"
+    elif p <= 0.5:
+        return 0.9, f"Bruine ({p:.1f} mm/h)"
+    elif p <= 2.0:
+        return 0.55, f"Pluie légère ({p:.1f} mm/h)"
+    elif p <= 5.0:
+        return 0.3, f"Pluie modérée ({p:.1f} mm/h)"
+    else:
+        return 0.15, f"Forte pluie ({p:.1f} mm/h)"
 
 
 def continuous_coef_score(coef, species):
@@ -1079,6 +1108,9 @@ def choose_best_window(df, species, technique, spot, tides_dict, carnet, shom_ds
             safe_float(r.get("cloud_cover")),
             species,
         )
+        rain_factor, rain_desc = rain_penalty(
+            safe_float(r.get("precipitation"))
+        )
         hist_s, hist_conf, hist_desc = historical_score(
             carnet, spot["id"], species, technique, coef, dt
         )
@@ -1132,6 +1164,11 @@ def choose_best_window(df, species, technique, spot, tides_dict, carnet, shom_ds
         # quelle que soit la qualité réelle des conditions.)
         score = score / total_weight
         score = clamp(score, 0, 10) * 10
+        # La pluie s'applique en facteur multiplicatif APRÈS la moyenne
+        # pondérée : diluée parmi 8-9 autres facteurs, elle perdrait trop
+        # d'impact même sous forte pluie, alors que c'est un critère
+        # quasi rédhibitoire pour toi.
+        score = round(score * rain_factor, 1)
 
         flags = [
             safe_float(r.get("wind_speed_10m")) is not None,
@@ -1139,6 +1176,7 @@ def choose_best_window(df, species, technique, spot, tides_dict, carnet, shom_ds
             safe_float(r.get("sea_surface_temperature")) is not None,
             bool(extrema),
             safe_float(r.get("wave_height")) is not None,
+            safe_float(r.get("precipitation")) is not None,
         ]
         confidence = score_confidence(
             max(0, (dt.date() - today).days),
@@ -1161,6 +1199,7 @@ def choose_best_window(df, species, technique, spot, tides_dict, carnet, shom_ds
             "pression": pressure_desc,
             "eau": water_desc,
             "lumiere": light_desc,
+            "pluie": rain_desc,
             "historique": hist_desc,
             "phase_desc": phase_desc,
             "wind_score": round(wind_s, 1),
@@ -1171,6 +1210,7 @@ def choose_best_window(df, species, technique, spot, tides_dict, carnet, shom_ds
             "light_score": round(light_s, 1),
             "tide_score": round(phase_s, 1),
             "coef_score": round(coef_s, 1),
+            "rain_score": round(rain_factor * 10, 1),
         })
 
     return pd.DataFrame(rows)
@@ -1295,6 +1335,34 @@ def fetch_marine(lat, lon):
 
 
 @st.cache_data(ttl=3600)
+@st.cache_data(ttl=30 * 86400, show_spinner=False)
+def fetch_maree_sites():
+    """Liste des sites/ports disponibles sur api-maree.fr (endpoint public,
+    sans clé). Mise en cache longue durée : cette liste ne change quasiment
+    jamais.
+    """
+    try:
+        r = requests.get("https://api-maree.fr/sites", headers=HEADERS, timeout=15)
+        r.raise_for_status()
+        return r.json().get("sites", [])
+    except Exception as e:
+        st.sidebar.warning(f"Liste des sites de marée indisponible : {e}")
+        return []
+
+
+def nearest_maree_site(lat, lon, sites):
+    """Site le plus proche des coordonnées données, et sa distance en km."""
+    best, best_dist = None, None
+    for s in sites:
+        try:
+            d = haversine(lat, lon, float(s["latitude"]), float(s["longitude"]))
+        except Exception:
+            continue
+        if best_dist is None or d < best_dist:
+            best, best_dist = s, d
+    return best, best_dist
+
+
 def fetch_tides(site_slug, start_date, end_date):
     if not API_KEY_MAREE:
         return {}
@@ -1425,12 +1493,39 @@ with st.sidebar:
 
     if zone_mode == "🏠 Zone habituelle":
         spot_names = [s["nom"] for s in SPOTS]
-        selected_spot_name = st.selectbox("Secteur", spot_names)
+        # Index par défaut piloté par le dernier clic sur la carte (onglet
+        # Carte & spots), le cas échéant.
+        default_spot_id = st.session_state.get("selected_spot_id", SPOTS[0]["id"])
+        default_index = next(
+            (i for i, s in enumerate(SPOTS) if s["id"] == default_spot_id), 0
+        )
+        selected_spot_name = st.selectbox(
+            "Secteur", spot_names, index=default_index, key="sidebar_spot_select"
+        )
         spot = next(s for s in SPOTS if s["nom"] == selected_spot_name)
+        st.session_state["selected_spot_id"] = spot["id"]
     else:
         zone_name = st.text_input("Nom de la zone", value="Nouveau secteur")
-        vac_lat = st.number_input("Latitude", value=float(CENTER["lat"]), format="%.5f")
-        vac_lon = st.number_input("Longitude", value=float(CENTER["lon"]), format="%.5f")
+        if "vac_lat" not in st.session_state:
+            st.session_state["vac_lat"] = float(CENTER["lat"])
+        if "vac_lon" not in st.session_state:
+            st.session_state["vac_lon"] = float(CENTER["lon"])
+
+        vac_lat = st.number_input("Latitude", format="%.5f", key="vac_lat")
+        vac_lon = st.number_input("Longitude", format="%.5f", key="vac_lon")
+
+        with st.expander("🗺️ Choisir sur la carte"):
+            vac_map = folium.Map(location=[vac_lat, vac_lon], zoom_start=6)
+            folium.Marker([vac_lat, vac_lon], tooltip="Position actuelle").add_to(vac_map)
+            vac_map_data = st_folium(vac_map, height=300, width="100%", key="vac_map_widget")
+            if vac_map_data and vac_map_data.get("last_clicked"):
+                new_lat = round(vac_map_data["last_clicked"]["lat"], 5)
+                new_lon = round(vac_map_data["last_clicked"]["lng"], 5)
+                if (new_lat, new_lon) != (round(vac_lat, 5), round(vac_lon, 5)):
+                    st.session_state["vac_lat"] = new_lat
+                    st.session_state["vac_lon"] = new_lon
+                    st.rerun()
+
         spot = {
             "id": "custom_" + re.sub(r"[^a-z0-9]+", "_", zone_name.lower()).strip("_")[:40],
             "nom": zone_name, "lat": vac_lat, "lon": vac_lon,
@@ -1584,17 +1679,38 @@ if "sea_surface_temperature" in df.columns:
 
 df["date"] = df["time"].dt.strftime("%Y-%m-%d")
 
-# Marées
+# Marées : sélection automatique du port api-maree.fr le plus proche du
+# spot analysé (utile aussi bien au Croisic qu'en mode vacances, où aucun
+# site n'est codé en dur).
+maree_sites = fetch_maree_sites()
+nearest_site, nearest_dist_km = nearest_maree_site(spot["lat"], spot["lon"], maree_sites)
+
 dates = sorted(df["date"].dropna().unique())
 start_date = dates[0]
 end_date = dates[-1]
 
 # Fallback si pas de clé : on continue à afficher météo/mer.
-tides_dict = fetch_tides(
-    "le-croisic",
-    start_date,
-    end_date,
-) if API_KEY_MAREE else {}
+tides_dict = {}
+if API_KEY_MAREE and nearest_site:
+    tides_dict = fetch_tides(
+        nearest_site["site_id"],
+        start_date,
+        end_date,
+    )
+    site_label = nearest_site.get("site_name") or nearest_site.get("name") or nearest_site["site_id"]
+    if nearest_dist_km is not None and nearest_dist_km > 50:
+        st.sidebar.warning(
+            f"⚠️ Port de marée le plus proche : {site_label} "
+            f"({nearest_dist_km:.0f} km) — assez loin, les marées locales "
+            f"peuvent différer sensiblement de celles affichées."
+        )
+    else:
+        st.sidebar.caption(
+            f"🌊 Marées : {site_label}"
+            + (f" ({nearest_dist_km:.0f} km)" if nearest_dist_km is not None else "")
+        )
+elif API_KEY_MAREE and not nearest_site:
+    st.sidebar.warning("Impossible de déterminer le port de marée le plus proche.")
 
 # Si api-maree n'est pas configurée, on signale clairement.
 if not API_KEY_MAREE:
@@ -1676,7 +1792,7 @@ with tab_dashboard:
         top_display = top[
             [
                 "Créneau", "score", "confiance", "phase", "coef",
-                "courant", "vent", "houle", "pression", "eau"
+                "courant", "vent", "houle", "pression", "eau", "pluie"
             ]
         ].rename(
             columns={
@@ -1689,40 +1805,116 @@ with tab_dashboard:
                 "houle": "Houle",
                 "pression": "Pression",
                 "eau": "Eau",
+                "pluie": "Pluie",
             }
         )
 
         st.markdown("### 🏆 Meilleurs créneaux")
         st.dataframe(
-            top_display,
+            top_display.style.background_gradient(
+                subset=["Indice"], cmap="RdYlGn", vmin=0, vmax=100
+            ),
             use_container_width=True,
             hide_index=True,
         )
 
         st.markdown("### 📅 Vue par jour")
+        # Ligne au score maximal de chaque jour (et non plus "premier élément
+        # du groupe", qui prenait systématiquement l'heure 00:00 — d'où la
+        # colonne "meilleure heure" toujours à zéro).
+        best_idx = df_score.groupby("date")["score"].idxmax()
         daily = (
-            df_score.groupby("date")
-            .agg(
-                indice_max=("score", "max"),
-                confiance=("confiance", "mean"),
-                meilleur_heure=("heure", lambda x: x.iloc[0]),
-            )
-            .reset_index()
+            df_score.loc[best_idx, ["date", "score", "confiance", "heure"]]
+            .sort_values("date")  # tri chronologique (format ISO YYYY-MM-DD)
+            .reset_index(drop=True)
         )
         daily["date"] = pd.to_datetime(daily["date"]).dt.strftime("%d/%m")
+        daily = daily.rename(columns={
+            "date": "Date",
+            "score": "Indice",
+            "confiance": "Confiance %",
+            "heure": "Meilleure heure",
+        })
         st.dataframe(
-            daily.sort_values("indice_max", ascending=False),
+            daily.style.background_gradient(
+                subset=["Indice"], cmap="RdYlGn", vmin=0, vmax=100
+            ),
             use_container_width=True,
             hide_index=True,
         )
 
         st.markdown("### 🔍 Analyse détaillée")
-        chosen_date = st.selectbox(
-            "Date",
-            sorted(df_score["date"].unique()),
-            key="detail_date",
-        )
+        st.caption("Clique un jour pour voir le détail")
+
+        unique_dates = sorted(df_score["date"].unique())
+        best_per_day = df_score.loc[df_score.groupby("date")["score"].idxmax()].set_index("date")
+
+        if "detail_date" not in st.session_state or st.session_state["detail_date"] not in unique_dates:
+            st.session_state["detail_date"] = unique_dates[0]
+
+        def _score_dot(score):
+            if score is None:
+                return "⚪"
+            if score >= 65:
+                return "🟢"
+            if score >= 40:
+                return "🟠"
+            return "🔴"
+
+        n_cols = 7
+        for start in range(0, len(unique_dates), n_cols):
+            row_dates = unique_dates[start:start + n_cols]
+            cols = st.columns(n_cols)
+            for i, d in enumerate(row_dates):
+                score_d = best_per_day.loc[d, "score"] if d in best_per_day.index else None
+                label_date = pd.to_datetime(d).strftime("%d/%m")
+                btn_label = f"{_score_dot(score_d)} {label_date}"
+                is_selected = d == st.session_state["detail_date"]
+                with cols[i]:
+                    if st.button(
+                        btn_label,
+                        key=f"day_btn_{d}",
+                        use_container_width=True,
+                        type="primary" if is_selected else "secondary",
+                    ):
+                        st.session_state["detail_date"] = d
+                        st.rerun()
+
+        chosen_date = st.session_state["detail_date"]
         day = df_score[df_score["date"] == chosen_date].copy()
+
+        # Seuils identiques à la pastille des boutons ci-dessus :
+        # 🟢 ≥ 65, 🟠 40-65, 🔴 < 40.
+        BADGE_COLORS = {
+            "good": ("#e6f4ea", "#1b5e20"),
+            "mid": ("#fff4e5", "#8a5300"),
+            "bad": ("#fdecea", "#8a1c1c"),
+        }
+
+        def _band(score10):
+            if score10 is None:
+                return "mid"
+            if score10 >= 6.5:
+                return "good"
+            if score10 >= 4.0:
+                return "mid"
+            return "bad"
+
+        def render_badges(items):
+            html = '<div style="display:flex;flex-wrap:wrap;gap:8px;margin:8px 0 16px">'
+            for label, score10, detail in items:
+                bg, fg = BADGE_COLORS[_band(score10)]
+                score_txt = f"{score10:.1f}/10" if score10 is not None else "—"
+                html += (
+                    f'<div style="background:{bg};color:{fg};border-radius:8px;'
+                    f'padding:8px 12px;min-width:130px;flex:1">'
+                    f'<div style="font-size:11px;opacity:.85">{label}</div>'
+                    f'<div style="font-size:15px;font-weight:600">{score_txt}</div>'
+                    f'<div style="font-size:11px">{detail}</div>'
+                    f'</div>'
+                )
+            html += '</div>'
+            st.markdown(html, unsafe_allow_html=True)
 
         if not day.empty:
             best_day = day.sort_values("score", ascending=False).iloc[0]
@@ -1731,32 +1923,21 @@ with tab_dashboard:
                 f"→ **{best_day['score']:.0f}/100**"
             )
 
-            a, b, c, d = st.columns(4)
-            a.metric("Marée", f"{best_day['tide_score']:.1f}/10")
-            b.metric("Courant", f"{best_day['current_score']:.1f}/10")
-            c.metric("Houle", f"{best_day['wave_score']:.1f}/10")
-            d.metric("Pression", f"{best_day['pressure_score']:.1f}/10")
+            c1, c2 = st.columns(2)
+            c1.metric("Coefficient", f"{best_day['coef']:.0f}")
+            c2.metric("Confiance", f"{best_day['confiance']}%")
 
-            a, b, c, d = st.columns(4)
-            a.metric("Eau", f"{best_day['water_score']:.1f}/10")
-            b.metric("Lumière", f"{best_day['light_score']:.1f}/10")
-            b.write(best_day["lumiere"] if "lumiere" in best_day else "")
-            c.metric("Coefficient", f"{best_day['coef']:.0f}")
-            d.metric("Confiance", f"{best_day['confiance']}%")
-
-            st.write("**Pourquoi ce créneau ?**")
-            reasons = [
-                f"🌊 Marée : {best_day['phase_desc']}",
-                f"🌊 Courant : {best_day['courant']}",
-                f"🌬️ Vent : {best_day['vent']}",
-                f"🌊 Houle : {best_day['houle']}",
-                f"📉 Pression : {best_day['pression']}",
-                f"🌡️ Eau : {best_day['eau']}",
-                f"☀️ Lumière : {best_day['lumiere']}",
-                f"📖 Historique : {best_day['historique']}",
-            ]
-            for reason in reasons:
-                st.write(reason)
+            render_badges([
+                ("Marée", best_day["tide_score"], best_day["phase_desc"]),
+                ("Courant", best_day["current_score"], best_day["courant"]),
+                ("Vent", best_day["wind_score"], best_day["vent"]),
+                ("Houle", best_day["wave_score"], best_day["houle"]),
+                ("Pression", best_day["pressure_score"], best_day["pression"]),
+                ("Eau", best_day["water_score"], best_day["eau"]),
+                ("Lumière", best_day["light_score"], best_day["lumiere"]),
+                ("Pluie", best_day["rain_score"], best_day["pluie"]),
+                ("Historique", None, best_day["historique"]),
+            ])
 
             st.markdown("**🌊 Pleines mers / basses mers du jour**")
             extrema_day = tides_dict.get(chosen_date, {}).get("extrema", [])
@@ -1786,6 +1967,8 @@ with tab_spots:
         "locale et les conditions de sécurité avant de pêcher."
     )
 
+    st.caption("👆 Clique un repère pour l'utiliser comme secteur actif.")
+
     m = folium.Map(
         location=[CENTER["lat"], CENTER["lon"]],
         zoom_start=11,
@@ -1810,7 +1993,9 @@ with tab_spots:
 
     for s in SPOTS:
         val = s["bar"] if species == "Bar" else s["daurade"]
-        color = "green" if val >= 9 else ("orange" if val >= 8 else "blue")
+        is_active = s["id"] == spot["id"]
+        color = "red" if is_active else ("green" if val >= 9 else ("orange" if val >= 8 else "blue"))
+        icon_name = "star" if is_active else "map-marker"
 
         popup = (
             f"<b>{s['nom']}</b><br>"
@@ -1826,10 +2011,28 @@ with tab_spots:
             [s["lat"], s["lon"]],
             popup=folium.Popup(popup, max_width=350),
             tooltip=f"{s['nom']} — {val}/10",
-            icon=folium.Icon(color=color, icon="map-marker"),
+            icon=folium.Icon(color=color, icon=icon_name),
         ).add_to(m)
 
-    st_folium(m, height=600, width="100%", key="spots_map")
+    spots_map_data = st_folium(m, height=600, width="100%", key="spots_map")
+
+    clicked_spot_id = None
+    if spots_map_data and spots_map_data.get("last_object_clicked_tooltip"):
+        tooltip = spots_map_data["last_object_clicked_tooltip"]
+        for s in SPOTS:
+            if tooltip.startswith(s["nom"]):
+                clicked_spot_id = s["id"]
+                break
+    elif spots_map_data and spots_map_data.get("last_object_clicked"):
+        lat_c = spots_map_data["last_object_clicked"]["lat"]
+        lon_c = spots_map_data["last_object_clicked"]["lng"]
+        best = min(SPOTS, key=lambda s: haversine(lat_c, lon_c, s["lat"], s["lon"]))
+        if haversine(lat_c, lon_c, best["lat"], best["lon"]) < 0.5:
+            clicked_spot_id = best["id"]
+
+    if clicked_spot_id and clicked_spot_id != st.session_state.get("selected_spot_id"):
+        st.session_state["selected_spot_id"] = clicked_spot_id
+        st.rerun()
 
     spot_df = pd.DataFrame(
         [
