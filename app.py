@@ -1951,40 +1951,6 @@ with tab_dashboard:
             f"{SPECIES[species]['emoji']} {species} — {technique} — {spot['nom']}"
         )
 
-        # Top créneaux
-        top = (
-            df_score.sort_values(["score", "confiance"], ascending=False)
-            .head(15)
-            .copy()
-        )
-        top["Créneau"] = top["datetime"].dt.strftime("%d/%m %H:%M")
-        top_display = top[
-            [
-                "Créneau", "score", "confiance", "phase", "coef",
-                "courant", "vent", "houle", "pression", "eau", "pluie"
-            ]
-        ].rename(
-            columns={
-                "score": "Indice",
-                "confiance": "Confiance %",
-                "phase": "Marée",
-                "coef": "Coef",
-                "courant": "Courant",
-                "vent": "Vent",
-                "houle": "Houle",
-                "pression": "Pression",
-                "eau": "Eau",
-                "pluie": "Pluie",
-            }
-        )
-
-        st.markdown("### 🏆 Meilleurs créneaux")
-        st.dataframe(
-            styled_score_table(top_display, "Indice"),
-            use_container_width=True,
-            hide_index=True,
-        )
-
         st.markdown("### 📅 Vue par jour")
         # Ligne au score maximal de chaque jour (et non plus "premier élément
         # du groupe", qui prenait systématiquement l'heure 00:00 — d'où la
@@ -2167,15 +2133,14 @@ with tab_dashboard:
 
             st.markdown(
                 f"#### {chosen_date} · {best_day['heure']} "
-                f"{'(meilleur moment) ' if is_best else ''}"
-                f"→ **{best_day['score']:.0f}/100**"
+                f"{'(meilleur moment)' if is_best else ''}"
             )
 
             c1, c2 = st.columns(2)
-            c1.metric("Coefficient", f"{best_day['coef']:.0f}")
+            c1.metric("Indice", f"{best_day['score']:.0f}/100")
             c2.metric("Confiance", f"{best_day['confiance']}%")
 
-            render_badges([
+            factors = [
                 ("Marée", best_day["tide_score"], best_day["phase_desc"]),
                 ("Courant", best_day["current_score"], best_day["courant"]),
                 ("Vent", best_day["wind_score"], best_day["vent"]),
@@ -2184,8 +2149,8 @@ with tab_dashboard:
                 ("Eau", best_day["water_score"], best_day["eau"]),
                 ("Lumière", best_day["light_score"], best_day["lumiere"]),
                 ("Pluie", best_day["rain_score"], best_day["pluie"]),
-                ("Historique", None, best_day["historique"]),
-            ])
+            ]
+            render_badges(factors + [("Historique", None, best_day["historique"])])
 
             if "precipitation" in df.columns:
                 pluie_jour = df.loc[df["date"] == chosen_date, "precipitation"].sum()
@@ -2195,6 +2160,49 @@ with tab_dashboard:
                         f"ce jour-là (cumul {pluie_jour:.1f} mm sur 24h). "
                         f"Vérifie les horaires avant de partir."
                     )
+
+            # --- Résumé, recommandation et alternative ---
+            st.markdown("#### 📌 Résumé du créneau")
+            factors_sorted = sorted(factors, key=lambda f: f[1])
+            faibles = [f for f in factors_sorted if f[1] <= 5][:2]
+            forts = [f for f in factors_sorted[::-1] if f[1] >= 7][:2]
+            if forts:
+                st.write(
+                    "✅ Points forts : "
+                    + ", ".join(f"{n} ({s:.1f}/10)" for n, s, _ in forts)
+                )
+            if faibles:
+                st.write(
+                    "⚠️ Points de vigilance : "
+                    + ", ".join(f"{n} ({s:.1f}/10)" for n, s, _ in faibles)
+                )
+            if not forts and not faibles:
+                st.write("Conditions globalement moyennes, sans facteur particulièrement favorable ou défavorable.")
+
+            st.markdown("#### 🎯 Technique recommandée")
+            reco_principale = recommendation_for(species, technique, best_day["score"], best_day, spot)
+            st.info(f"**{technique}** — {reco_principale}")
+
+            st.markdown("#### 🔄 Alternative si ça ne mord pas")
+            ALT_TECHNIQUE = {
+                "Bar": {
+                    "Surface": "Jerkbait / minnow",
+                    "Métal": "Leurre souple",
+                    "Jerkbait / minnow": "Métal",
+                    "Leurre souple": "Jerkbait / minnow",
+                },
+                "Daurade royale": {
+                    "Crabe au posé": "Couteau / coquillage",
+                    "Couteau / coquillage": "Ver",
+                    "Ver": "Crabe au posé",
+                },
+            }
+            default_alt = {"Bar": "Leurre souple", "Daurade royale": "Crabe au posé"}
+            alt_technique = ALT_TECHNIQUE.get(species, {}).get(technique)
+            if not alt_technique or alt_technique == technique:
+                alt_technique = default_alt.get(species, technique)
+            reco_alt = recommendation_for(species, alt_technique, best_day["score"], best_day, spot)
+            st.caption(f"**{alt_technique}** — {reco_alt}")
 
             st.markdown("**🌊 Pleines mers / basses mers du jour**")
             extrema_day = tides_dict.get(chosen_date, {}).get("extrema", [])
