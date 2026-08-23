@@ -1001,6 +1001,29 @@ def current_score_value(speed_ms, species):
     return 3.0
 
 
+def _extrema_window(tides_dict, date_key):
+    """Concatène les extrema de la veille, du jour et du lendemain, pour
+    permettre à tide_phase_score()/shom_current_at() d'encadrer correctement
+    les heures proches de minuit (continuité entre jours au lieu de se
+    limiter aux seuls événements du jour, ce qui produisait des 'Phase
+    incomplète' près des bornes de journée).
+    """
+    try:
+        d = pd.Timestamp(date_key).date()
+    except Exception:
+        return tides_dict.get(date_key, {}).get("extrema", [])
+
+    keys = [
+        (d - timedelta(days=1)).strftime("%Y-%m-%d"),
+        date_key,
+        (d + timedelta(days=1)).strftime("%Y-%m-%d"),
+    ]
+    combined = []
+    for k in keys:
+        combined.extend(tides_dict.get(k, {}).get("extrema", []))
+    return combined
+
+
 def choose_best_window(df, species, technique, spot, tides_dict, carnet, shom_ds=None, shom_reference="PM"):
     """Calcule un score par heure pour les prochaines 8 journées.
     On conserve les créneaux réellement disponibles dans les données."""
@@ -1020,8 +1043,11 @@ def choose_best_window(df, species, technique, spot, tides_dict, carnet, shom_ds
 
         date_key = dt.strftime("%Y-%m-%d")
         tide_info = tides_dict.get(date_key, {})
-        extrema = tide_info.get("extrema", [])
         coef = safe_float(tide_info.get("max_coef"), 70)
+        # Fenêtre étendue (veille/jour/lendemain) pour un encadrement PM/BM
+        # fiable même en tout début ou toute fin de journée.
+        extrema = _extrema_window(tides_dict, date_key)
+        tide_info_window = {**tide_info, "extrema": extrema}
 
         phase_s, phase_desc, phase, _ = tide_phase_score(dt, extrema, species)
         coef_s = continuous_coef_score(coef, species)
@@ -1058,7 +1084,7 @@ def choose_best_window(df, species, technique, spot, tides_dict, carnet, shom_ds
         )
 
         shom_current = shom_current_at(
-            shom_ds, spot["lat"], spot["lon"], dt, tide_info, reference=shom_reference
+            shom_ds, spot["lat"], spot["lon"], dt, tide_info_window, reference=shom_reference
         )
         if shom_current is not None:
             current_s = current_score_value(shom_current["speed_ms"], species)
@@ -1296,9 +1322,22 @@ def fetch_tides(site_slug, start_date, end_date):
                 for e in extrema
                 if e.get("type") == "PM" and safe_float(e.get("coef")) is not None
             ]
+            # L'API renvoie "time" au format "HH:MM" SEUL, sans date. Sans
+            # correction, pd.to_datetime("HH:MM") complète silencieusement
+            # avec la date d'exécution du script au lieu de la date réelle
+            # de la marée, ce qui fait échouer l'encadrement PM/BM pour
+            # tous les jours autres que celui du run ("Phase incomplète").
+            # On reconstruit ici un horodatage complet jour + heure.
+            full_extrema = []
+            for e in extrema:
+                e = dict(e)
+                t = e.get("time")
+                if t and "T" not in str(t) and len(str(t)) <= 5:
+                    e["time"] = f"{d}T{t}:00"
+                full_extrema.append(e)
             out[d] = {
                 "max_coef": max(coefs) if coefs else 70,
-                "extrema": extrema,
+                "extrema": full_extrema,
             }
         return out
     except Exception as e:
@@ -1718,6 +1757,23 @@ with tab_dashboard:
             ]
             for reason in reasons:
                 st.write(reason)
+
+            st.markdown("**🌊 Pleines mers / basses mers du jour**")
+            extrema_day = tides_dict.get(chosen_date, {}).get("extrema", [])
+            if extrema_day:
+                rows_tide = []
+                for e in sorted(extrema_day, key=lambda x: str(x.get("time", ""))):
+                    t = str(e.get("time", ""))
+                    heure = t.split("T")[-1][:5] if "T" in t else t
+                    rows_tide.append({
+                        "Type": "Pleine mer" if e.get("type") == "PM" else "Basse mer",
+                        "Heure": heure,
+                        "Hauteur (m)": e.get("height"),
+                        "Coefficient": e.get("coef", "—"),
+                    })
+                st.dataframe(pd.DataFrame(rows_tide), use_container_width=True, hide_index=True)
+            else:
+                st.caption("Aucune donnée de marée disponible pour ce jour.")
 
 # ============================================================
 # TAB 2 : carte spots
