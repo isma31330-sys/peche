@@ -442,7 +442,7 @@ def wave_score(wave_h, wave_period, species, spot):
     return clamp(s), f"{wave_h:.1f} m / {period:.1f} s"
 
 
-def pressure_score(pressure, d3, d6, d12):
+def pressure_score(pressure, d3, d6, d12, d24=None):
     if pressure is None:
         return 5.0, "Pression indisponible"
 
@@ -474,7 +474,18 @@ def pressure_score(pressure, d3, d6, d12):
     elif pressure > 1030:
         s -= 0.5
 
-    return clamp(s), f"{pressure:.1f} hPa — {label} ({trend:+.1f} hPa/6h)"
+    # Fenêtre de repos post-hausse (24-48h) : une forte hausse de pression sur
+    # les dernières 24h laisse les poissons "calés" quelques temps même une
+    # fois la tendance instantanée (6h) redevenue stable — la doc décrit
+    # cette baisse d'activité comme un phénomène de 24 à 48h, pas juste un
+    # état instantané. On ne pénalise que si la tendance 6h ne signale déjà
+    # pas elle-même une hausse nette (sinon double comptage).
+    recovery_note = ""
+    if d24 is not None and d24 >= 4 and -0.7 <= trend < 2:
+        s -= 1.5
+        recovery_note = " — repos post-hausse (24h)"
+
+    return clamp(s), f"{pressure:.1f} hPa — {label}{recovery_note} ({trend:+.1f} hPa/6h)"
 
 
 def water_score(sst, delta24=None, species="Bar"):
@@ -514,7 +525,20 @@ def water_score(sst, delta24=None, species="Bar"):
     )
 
 
-def light_score(dt_local, cloud, species):
+def turbidity_index(wave_h, precip_mm_h):
+    """Estimation grossière (0=eau claire, 10=eau très trouble) à partir de la
+    houle et de la pluie de l'heure — pas une mesure directe (aucune source
+    météo utilisée ne fournit la turbidité réelle). Sert à moduler l'effet du
+    grand soleil sur la méfiance du poisson (eau déjà trouble = la lumière de
+    surface pénètre moins, donc l'effet est déjà partiellement neutralisé) et
+    à orienter le choix de couleur de leurre dans recommendation_for().
+    """
+    wave_h = wave_h or 0.0
+    precip_mm_h = precip_mm_h or 0.0
+    return clamp(wave_h * 3.0 + precip_mm_h * 1.5, 0, 10)
+
+
+def light_score(dt_local, cloud, species, turbidity=None):
     hour = dt_local.hour + dt_local.minute / 60
     transition = (
         (5.0 <= hour <= 8.5)
@@ -538,13 +562,22 @@ def light_score(dt_local, cloud, species):
             base = 6.5
 
     if cloud is not None:
+        # Eau déjà trouble (houle/pluie) : la lumière de surface pénètre
+        # moins, donc la pénalité "grand soleil" compte moins — pas une
+        # nouvelle pondération indépendante (éviterait un double comptage
+        # avec les poids houle/pluie déjà présents dans le score global),
+        # juste une atténuation d'un effet déjà modélisé ici.
+        sun_penalty_scale = 1.0
+        if turbidity is not None and turbidity >= 5:
+            sun_penalty_scale = 0.4
+
         if 20 <= cloud <= 75:
             # Couvert léger à modéré : lumière diffuse, souvent plus
             # favorable qu'un grand soleil (moins de méfiance du poisson).
             base += 0.6
         elif cloud < 15:
             # Ciel bien dégagé / grand soleil : lumière crue.
-            base -= 0.4
+            base -= 0.4 * sun_penalty_scale
         elif cloud > 90:
             base -= 0.3
 
@@ -581,9 +614,15 @@ def continuous_coef_score(coef, species):
     c = float(coef)
 
     if species == "Daurade royale":
-        # Favorise les coefficients moyens à forts sans rupture artificielle.
-        # Maximum indicatif autour de 90.
-        return clamp(10 - abs(c - 90) / 12)
+        # La documentation trouvée est partagée entre deux écoles : morte-eau
+        # (coefficient bas, pêche au posé prolongée, pic documenté ~50) et
+        # gros coefficient (daurade plus agressive, pic documenté ~95). Plutôt
+        # que trancher arbitrairement, on retient le meilleur des deux
+        # courbes — un creux réel autour de 70-75 (coefficient moyen, ni
+        # franchement morte-eau ni vive-eau) reste correct sans être optimal.
+        s_morte_eau = 10 - abs(c - 50) / 10
+        s_vive_eau = 10 - abs(c - 95) / 10
+        return clamp(max(s_morte_eau, s_vive_eau))
     else:
         # Bar : courant utile mais éviter de considérer les très gros coeffs
         # automatiquement meilleurs.
@@ -675,11 +714,17 @@ def tide_phase_score(dt, extrema, species):
         else:
             s = 7 - 3 * frac
 
+    # Bonus explicite ±2h autour du pic de marée (PM ou BM, avant ou après) :
+    # la doc cite spécifiquement cette fenêtre comme celle du courant maximal,
+    # en plus du score de phase ci-dessus qui raisonne en % du cycle.
     minutes_to_next = (nxt[0] - dt).total_seconds() / 60
-    if minutes_to_next <= 90:
+    minutes_since_prev = (dt - prev[0]).total_seconds() / 60
+    near_peak = minutes_to_next <= 120 or minutes_since_prev <= 120
+    if near_peak:
         s += 0.5
 
-    return clamp(s), f"{phase} — prochaine {nxt[1]} à {nxt[0].strftime('%H:%M')}", phase, minutes_to_next
+    peak_note = " · pic à ±2h" if near_peak else ""
+    return clamp(s), f"{phase} — prochaine {nxt[1]} à {nxt[0].strftime('%H:%M')}{peak_note}", phase, minutes_to_next
 
 
 def historical_score(carnet, spot_id, species, technique, coef, dt):
@@ -739,24 +784,57 @@ def score_confidence(days_ahead, data_flags, hist_conf, marine_available):
 
 
 def recommendation_for(species, technique, score, row, spot):
+    """Recommandation dynamique : la couleur/présentation varie avec la
+    turbidité estimée (eau claire → discret/naturel, eau trouble → vibrant/
+    voyant, s'appuie sur la ligne latérale), et l'animation varie avec la
+    température de l'eau (froide → lente, éviter la surface sous ~14°C pour
+    le bar). Sources : voir recherche_criteres_peche.md.
+    """
+    turb = row.get("turbidity_idx") if hasattr(row, "get") else None
+    sst = row.get("water_temp_c") if hasattr(row, "get") else None
+    cold_water = sst is not None and sst < 14
+
+    if turb is not None and turb >= 6:
+        couleur = "coloris vif (chartreuse, blanc, UV) — eau trouble, le poisson compte sur sa ligne latérale plus que sur la vue"
+    elif turb is not None and turb <= 2:
+        couleur = "coloris naturel/translucide — eau claire, reste discret"
+    else:
+        couleur = "coloris intermédiaire, reflets naturels"
+
     if species == "Bar":
         if technique == "Surface":
-            lure = "Surface 10–20 g, zones calmes/rochers ; privilégier aube ou crépuscule."
+            if cold_water:
+                lure = (
+                    f"Eau <14°C : la surface devient peu productive (le bar évolue plus "
+                    f"profond) — bascule sur un poisson nageur ou un leurre souple, "
+                    f"{couleur}, animation lente."
+                )
+            else:
+                lure = f"Surface 10–20 g, {couleur} ; privilégier aube ou crépuscule."
         elif technique == "Métal":
-            lure = "Casting jig 20–40 g si vent/courant et poissons fourrage présents."
+            lure = f"Casting jig 20–40 g si vent/courant et poissons fourrage présents, {couleur}."
         elif technique == "Jerkbait / minnow":
-            lure = "Minnow 12–18 cm, récupération lente à modérée près des cassures."
+            anim = "lente" if cold_water else "lente à modérée"
+            lure = f"Minnow 12–18 cm, {couleur}, récupération {anim} près des cassures."
         else:
-            lure = "Leurre souple 20–30 g ; tête plombée adaptée au courant, lancer en travers puis suivre la dérive."
+            anim = "lente, tête plombée légère" if cold_water else "adaptée au courant"
+            lure = f"Leurre souple 20–30 g, {couleur} ; animation {anim}, lancer en travers puis suivre la dérive."
         return lure
     else:
         if technique == "Crabe au posé":
-            return "Crabe vert, montage coulissant 50–80 g, fluoro 40–45/100, bas de ligne 1–1,5 m, hameçon fort n°1–2."
-        if technique == "Couteau / coquillage":
-            return "Couteau/coquillage sur montage coulissant, 50–80 g ; privilégier les bordures de courant et fonds coquilliers."
-        if technique == "Ver":
-            return "Ver marin sur montage coulissant léger à moyen ; intéressant lorsque le courant est modéré."
-        return "Surfcasting léger : 60–90 g selon courant, bas de ligne 40–45/100, appât naturel."
+            base = "Crabe vert, montage coulissant 50–80 g, fluoro 40–45/100, bas de ligne 1–1,5 m, hameçon fort n°1–2."
+        elif technique == "Couteau / coquillage":
+            base = "Couteau/coquillage sur montage coulissant, 50–80 g ; privilégier les bordures de courant et fonds coquilliers."
+        elif technique == "Ver":
+            base = "Ver marin sur montage coulissant léger à moyen ; intéressant lorsque le courant est modéré."
+        else:
+            base = "Surfcasting léger : 60–90 g selon courant, bas de ligne 40–45/100, appât naturel."
+
+        if turb is not None and turb <= 2:
+            base += " Eau claire : affine le bas de ligne (22/100) et reste discret, la daurade est méfiante."
+        elif turb is not None and turb >= 6:
+            base += " Mer agitée/eau trouble : privilégie un appât résistant (crabe dur, bibi)."
+        return base
 
 
 
@@ -1171,8 +1249,9 @@ def choose_best_window(df, species, technique, spot, tides_dict, carnet, shom_ds
             safe_float(r.get("wind_direction_10m")),
             species,
         )
+        wave_h_val = safe_float(r.get("wave_height"))
         wave_s, wave_desc = wave_score(
-            safe_float(r.get("wave_height")),
+            wave_h_val,
             safe_float(r.get("wave_period")),
             species,
             spot,
@@ -1182,20 +1261,23 @@ def choose_best_window(df, species, technique, spot, tides_dict, carnet, shom_ds
             safe_float(r.get("pressure_delta_3h")),
             safe_float(r.get("pressure_delta_6h")),
             safe_float(r.get("pressure_delta_12h")),
+            safe_float(r.get("pressure_delta_24h")),
         )
+        water_temp_val = safe_float(r.get("sea_surface_temperature"))
         water_s, water_desc = water_score(
-            safe_float(r.get("sea_surface_temperature")),
+            water_temp_val,
             safe_float(r.get("sst_delta_24h")),
             species,
         )
+        precip_val = safe_float(r.get("precipitation"))
+        turbidity = turbidity_index(wave_h_val, precip_val)
         light_s, light_desc = light_score(
             dt,
             safe_float(r.get("cloud_cover")),
             species,
+            turbidity=turbidity,
         )
-        rain_factor, rain_desc = rain_penalty(
-            safe_float(r.get("precipitation"))
-        )
+        rain_factor, rain_desc = rain_penalty(precip_val)
         hist_s, hist_conf, hist_desc = historical_score(
             carnet, spot["id"], species, technique, coef, dt
         )
@@ -1296,6 +1378,9 @@ def choose_best_window(df, species, technique, spot, tides_dict, carnet, shom_ds
             "tide_score": round(phase_s, 1),
             "coef_score": round(coef_s, 1),
             "rain_score": round(rain_factor * 10, 1),
+            "wave_height_m": wave_h_val,
+            "water_temp_c": water_temp_val,
+            "turbidity_idx": round(turbidity, 1),
         })
 
     return pd.DataFrame(rows)
