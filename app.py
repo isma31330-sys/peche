@@ -1387,18 +1387,20 @@ def shom_field_at_hour(shom_ds, tides_dict, date_key, hour_int, reference, lat_c
     proche de l'heure demandée séparément pour les situations coefficient 45
     et 95, puis on interpole entre les deux comme pour le score.
     Ne fonctionne qu'avec le format TXT/ZIP (pas encore le NetCDF).
+    Retourne (champ, repère_marée, erreur) où repère_marée est une chaîne
+    du type "PM+3"/"PM-1" (heures par rapport à la PM/BM de référence).
     """
     if not (isinstance(shom_ds, dict) and shom_ds.get("kind") == "txt"):
-        return None, "Visualisation disponible uniquement pour le format TXT/ZIP pour l'instant."
+        return None, None, "Visualisation disponible uniquement pour le format TXT/ZIP pour l'instant."
 
     df_pts = shom_ds["data"]
     if df_pts.empty or df_pts["coefficient"].isna().all():
-        return None, "Le fichier ne contient pas de colonne coefficient exploitable."
+        return None, None, "Le fichier ne contient pas de colonne coefficient exploitable."
 
     extrema = _extrema_window(tides_dict, date_key)
     tide_info = tides_dict.get(date_key, {})
     if not extrema:
-        return None, "Pas de données de marée pour ce jour (nécessaires pour situer l'échéance PM/BM)."
+        return None, None, "Pas de données de marée pour ce jour (nécessaires pour situer l'échéance PM/BM)."
     coef = safe_float(tide_info.get("max_coef"), 70)
 
     dt = _to_paris_aware(pd.Timestamp(f"{date_key} {hour_int:02d}:00:00"))
@@ -1416,8 +1418,10 @@ def shom_field_at_hour(shom_ds, tides_dict, date_key, hour_int, reference, lat_c
         if -6.01 <= dh <= 6.01:
             candidates.append((abs(dh), dh))
     if not candidates:
-        return None, f"Aucune échéance PM/BM ({reference}) à ±6h de {hour_int:02d}:00 ce jour-là."
+        return None, None, f"Aucune échéance PM/BM ({reference}) à ±6h de {hour_int:02d}:00 ce jour-là."
     _, dh = min(candidates)
+    dh_rounded = round(dh)
+    tide_label = reference if dh_rounded == 0 else f"{reference}{dh_rounded:+d}"
 
     def nearest_offset_subset(coeff_val):
         sub = df_pts[df_pts["coefficient"].sub(coeff_val).abs() < 1e-6]
@@ -1432,11 +1436,11 @@ def shom_field_at_hour(shom_ds, tides_dict, date_key, hour_int, reference, lat_c
     d45 = nearest_offset_subset(45.0)
     d95 = nearest_offset_subset(95.0)
     if d45.empty or d95.empty:
-        return None, "Situations coefficient 45/95 introuvables dans le fichier pour cette échéance."
+        return None, tide_label, "Situations coefficient 45/95 introuvables dans le fichier pour cette échéance."
 
     merged = d45.merge(d95, on=["lat", "lon"], suffixes=("_45", "_95"), how="inner")
     if merged.empty:
-        return None, "Grilles 45 et 95 non superposables (points non alignés)."
+        return None, tide_label, "Grilles 45 et 95 non superposables (points non alignés)."
 
     target = max(45.0, min(95.0, float(coef)))
     alpha = (target - 45.0) / 50.0
@@ -1448,18 +1452,26 @@ def shom_field_at_hour(shom_ds, tides_dict, date_key, hour_int, reference, lat_c
     )
     merged = merged[merged["dist_km"] <= radius_km]
     if merged.empty:
-        return None, f"Aucun point SHOM à moins de {radius_km:.0f} km du spot."
+        return None, tide_label, f"Aucun point SHOM à moins de {radius_km:.0f} km du spot."
 
     merged["speed_kn"] = np.hypot(merged["u"], merged["v"]) * 1.943844
     merged["direction"] = (np.degrees(np.arctan2(merged["u"], merged["v"])) + 360) % 360
-    return merged[["lat", "lon", "u", "v", "speed_kn", "direction"]].reset_index(drop=True), None
+    return merged[["lat", "lon", "u", "v", "speed_kn", "direction"]].reset_index(drop=True), tide_label, None
 
 
-def build_current_arrows_figure(hourly_fields, hours, center_lat, center_lon, arrow_scale=0.018):
+def build_current_arrows_figure(hourly_fields, hours, center_lat, center_lon, tide_labels=None, arrow_scale=0.018):
     """Construit une figure Plotly (fond OpenStreetMap, pas de clé requise)
     avec une flèche par point de grille et une frame par heure, pour le
     lecteur d'animation (play/pause + curseur) de l'onglet SHOM.
+    tide_labels : dict {heure: "PM+3"/"BM-1"/...} affiché à côté de l'heure
+    dans le curseur, pour situer chaque instant par rapport à la marée.
     """
+    tide_labels = tide_labels or {}
+
+    def frame_label(h):
+        tl = tide_labels.get(h)
+        return f"{h:02d}h · {tl}" if tl else f"{h:02d}h"
+
     def frame_traces(field_df):
         if field_df is None or field_df.empty:
             return [go.Scattermapbox(lat=[], lon=[], mode="lines"),
@@ -1492,7 +1504,7 @@ def build_current_arrows_figure(hourly_fields, hours, center_lat, center_lon, ar
     init_traces = frame_traces(first_field)
 
     frames = [
-        go.Frame(data=frame_traces(hourly_fields.get(h)), name=f"{h:02d}h")
+        go.Frame(data=frame_traces(hourly_fields.get(h)), name=frame_label(h))
         for h in hours
     ]
 
@@ -1513,8 +1525,8 @@ def build_current_arrows_figure(hourly_fields, hours, center_lat, center_lon, ar
         sliders=[dict(
             active=0,
             currentvalue={"prefix": "Heure : "},
-            steps=[dict(label=f"{h:02d}h", method="animate",
-                        args=[[f"{h:02d}h"], {"frame": {"duration": 0, "redraw": True}, "mode": "immediate"}])
+            steps=[dict(label=frame_label(h), method="animate",
+                        args=[[frame_label(h)], {"frame": {"duration": 0, "redraw": True}, "mode": "immediate"}])
                    for h in hours],
         )],
     )
@@ -2768,13 +2780,16 @@ with tab_shom:
                 with st.spinner("Calcul du champ de courant heure par heure..."):
                     hours = list(range(24))
                     hourly_fields = {}
+                    tide_labels = {}
                     last_err = None
                     for h in hours:
-                        field, err = shom_field_at_hour(
+                        field, tide_label, err = shom_field_at_hour(
                             shom_ds, tides_dict, viz_date, h, shom_reference,
                             spot["lat"], spot["lon"], radius_km=radius_km,
                         )
                         hourly_fields[h] = field
+                        if tide_label:
+                            tide_labels[h] = tide_label
                         if err:
                             last_err = err
 
@@ -2788,9 +2803,11 @@ with tab_shom:
                     st.caption(
                         f"{n_ok}/24 heures avec un champ de courant calculable dans un rayon de {radius_km} km. "
                         "Clique ▶️ Lecture pour l'animation (défile 1x sur la journée), "
-                        "ou utilise le curseur pour naviguer heure par heure."
+                        "ou utilise le curseur pour naviguer heure par heure. "
+                        f"\"{shom_reference}+3\"/\"{shom_reference}-1\" = 3h après / 1h avant la "
+                        f"{'pleine' if shom_reference == 'PM' else 'basse'} mer de référence."
                     )
-                    fig = build_current_arrows_figure(hourly_fields, hours, spot["lat"], spot["lon"])
+                    fig = build_current_arrows_figure(hourly_fields, hours, spot["lat"], spot["lon"], tide_labels=tide_labels)
                     st.plotly_chart(fig, use_container_width=True)
                     st.caption(
                         "⚠️ Limite connue : le bouton Lecture de Plotly joue la séquence une fois "
