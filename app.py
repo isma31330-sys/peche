@@ -247,6 +247,12 @@ SPECIES = {
     },
 }
 
+# "Daurade royale".lower().replace(" ", "_") donnerait "daurade_royale", qui
+# n'existe pas dans les dicts SPOTS/spot personnalisé (clé "daurade" seule)
+# — d'où le KeyError. Mapping explicite plutôt qu'une dérivation implicite
+# fragile.
+SPECIES_SPOT_KEY = {"Bar": "bar", "Daurade royale": "daurade"}
+
 # -----------------------------
 # Utilitaires
 # -----------------------------
@@ -273,24 +279,23 @@ def clamp(x, lo=0.0, hi=10.0):
 
 # Échelle de couleur partagée par TOUS les éléments colorés de l'interface
 # (tableaux, pastilles des boutons de jour, badges de détail) :
-# ≤50 = rouge plein (mauvais), ≥90 = vert plein (excellent),
-# dégradé continu rouge → orange → vert entre les deux.
-# Le point de bascule vers le vert est fixé à 90 (pas 100) : en pratique les
-# scores dépassent rarement 90/100, donc réserver le vert au 100 exact
-# écrasait toute la plage réellement observée dans une même teinte orange.
+# ≤50 = rouge plein (mauvais), 75 = vert léger, ≥90 = vert plein (excellent),
+# dégradé continu rouge → orange → vert clair → vert entre les paliers.
 def _mix_rgb(c1, c2, t):
     return tuple(round(c1[i] + (c2[i] - c1[i]) * t) for i in range(3))
 
 
 def score_rgb_100(v):
     v = max(0.0, min(100.0, float(v)))
-    RED, ORANGE, GREEN = (211, 47, 47), (245, 124, 0), (56, 142, 60)
+    RED, ORANGE, LGREEN, GREEN = (211, 47, 47), (245, 124, 0), (139, 195, 74), (56, 142, 60)
     if v <= 50:
         return RED
-    if v <= 72:
-        return _mix_rgb(RED, ORANGE, (v - 50) / 22)
+    if v <= 62:
+        return _mix_rgb(RED, ORANGE, (v - 50) / 12)
+    if v <= 75:
+        return _mix_rgb(ORANGE, LGREEN, (v - 62) / 13)
     if v <= 90:
-        return _mix_rgb(ORANGE, GREEN, (v - 72) / 18)
+        return _mix_rgb(LGREEN, GREEN, (v - 75) / 15)
     return GREEN
 
 
@@ -1227,7 +1232,7 @@ def choose_best_window(df, species, technique, spot, tides_dict, carnet, shom_ds
             + water_s * w["eau"]
             + pressure_s * w["pression"]
             + hist_s * w["historique"]
-            + spot[species.lower().replace(" ", "_")] / 10 * w["spot"] * 10
+            + spot[SPECIES_SPOT_KEY[species]] / 10 * w["spot"] * 10
         )
 
         # Le coefficient est déjà implicitement lié à la phase, mais on le
@@ -1905,6 +1910,10 @@ with tab_dashboard:
             .sort_values("date")  # tri chronologique (format ISO YYYY-MM-DD)
             .reset_index(drop=True)
         )
+        # Samedi/dimanche (calculé avant reformatage de "date", conservé par
+        # index pour la mise en valeur visuelle plus bas).
+        is_weekend = pd.to_datetime(daily["date"]).dt.weekday >= 5
+
         # Pluie sur la JOURNÉE entière (distinct du badge de l'heure retenue,
         # qui ne reflète que le créneau précis choisi — un créneau sec peut
         # très bien tomber un jour globalement pluvieux ailleurs).
@@ -1917,30 +1926,59 @@ with tab_dashboard:
         else:
             daily["pluie_jour_mm"] = None
 
-        # Indice heure par heure (00:00 à 23:00), une colonne par heure.
+        # Indice heure par heure (00 à 23), une colonne par heure. En-têtes
+        # raccourcis ("07" plutôt que "07:00") pour limiter la largeur totale.
         hour_pivot = df_score.pivot_table(index="date", columns="heure", values="score", aggfunc="first")
-        hour_cols = sorted(hour_pivot.columns)
-        hour_pivot = hour_pivot.reindex(columns=hour_cols)
+        hour_cols_full = sorted(hour_pivot.columns)
+        hour_pivot = hour_pivot.reindex(columns=hour_cols_full)
+        hour_cols = [h[:2] for h in hour_cols_full]
+        hour_pivot.columns = hour_cols
         daily = daily.merge(hour_pivot, left_on="date", right_index=True, how="left")
 
         daily["date"] = pd.to_datetime(daily["date"]).dt.strftime("%d/%m")
         daily = daily.rename(columns={
             "date": "Date",
             "score": "Indice",
-            "confiance": "Confiance %",
-            "heure": "Meilleure heure",
-            "pluie_jour_mm": "Pluie du jour (mm)",
+            "confiance": "Conf.%",
+            "heure": "Heure",
+            "pluie_jour_mm": "Pluie (mm)",
         })
         st.caption(
-            "\"Pluie du jour\" = cumul sur les 24h, même si le créneau retenu "
-            "ci-dessus est sec (l'algorithme cherche la meilleure fenêtre, "
-            "pas forcément toute la journée). Colonnes 00:00-23:00 : indice "
-            "heure par heure (case vide = donnée indisponible pour cette heure)."
+            "\"Pluie (mm)\" = cumul sur les 24h, même si le créneau retenu "
+            "est sec (l'algorithme cherche la meilleure fenêtre, pas "
+            "forcément toute la journée). Colonnes 00-23 : indice heure par "
+            "heure (case vide = donnée indisponible). Week-ends surlignés."
         )
+
+        def _weekend_row_style(row):
+            styles = [""] * len(row)
+            if is_weekend.loc[row.name]:
+                try:
+                    i = list(row.index).index("Date")
+                    styles[i] = "font-weight:700;background-color:rgba(66,133,244,0.18)"
+                except ValueError:
+                    pass
+            return styles
+
+        daily_styler = styled_score_table(
+            daily, ["Indice"] + hour_cols, rain_column="Pluie (mm)"
+        ).apply(_weekend_row_style, axis=1)
+
+        col_cfg = {
+            "Date": st.column_config.TextColumn(width="small"),
+            "Indice": st.column_config.NumberColumn(width="small"),
+            "Conf.%": st.column_config.NumberColumn(width="small"),
+            "Heure": st.column_config.TextColumn(width="small"),
+            "Pluie (mm)": st.column_config.NumberColumn(width="small"),
+        }
+        for h in hour_cols:
+            col_cfg[h] = st.column_config.NumberColumn(width="small")
+
         st.dataframe(
-            styled_score_table(daily, ["Indice"] + hour_cols, rain_column="Pluie du jour (mm)"),
+            daily_styler,
             use_container_width=True,
             hide_index=True,
+            column_config=col_cfg,
         )
 
         st.markdown("### 🔍 Analyse détaillée")
