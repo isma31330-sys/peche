@@ -1950,36 +1950,59 @@ with tab_dashboard:
             "heure (case vide = donnée indisponible). Week-ends surlignés."
         )
 
-        def _weekend_row_style(row):
-            styles = [""] * len(row)
-            if is_weekend.loc[row.name]:
-                try:
-                    i = list(row.index).index("Date")
-                    styles[i] = "font-weight:700;background-color:rgba(66,133,244,0.18)"
-                except ValueError:
-                    pass
-            return styles
+        def _daily_table_html(df_daily, hcols, weekend_mask):
+            """Rendu HTML compact (pas st.dataframe) : le composant Streamlit
+            standard impose un padding par colonne difficile à comprimer
+            sous ~75-90px, ce qui gaspille beaucoup de largeur sur un
+            tableau à 24 colonnes horaires. Un <table> HTML classique
+            donne un contrôle total du padding/largeur par colonne.
+            """
+            widths = {"Date": "50px", "Indice": "38px", "Conf.%": "42px",
+                      "Heure": "44px", "Pluie (mm)": "54px"}
+            cols = ["Date", "Indice", "Conf.%", "Heure", "Pluie (mm)"] + hcols
+            parts = [
+                '<div style="overflow-x:auto">'
+                '<table style="border-collapse:collapse;font-size:12px">'
+                "<thead><tr>"
+            ]
+            for c in cols:
+                w = widths.get(c, "30px")
+                parts.append(
+                    f'<th style="padding:3px 4px;text-align:center;white-space:nowrap;'
+                    f'border-bottom:1px solid rgba(128,128,128,.4);width:{w};min-width:{w}">{c}</th>'
+                )
+            parts.append("</tr></thead><tbody>")
+            for idx, row in df_daily.iterrows():
+                weekend = bool(weekend_mask.loc[idx])
+                date_css = "font-weight:700;background-color:rgba(66,133,244,.18)" if weekend else ""
+                parts.append("<tr>")
+                parts.append(f'<td style="padding:3px 4px;white-space:nowrap;{date_css}">{row["Date"]}</td>')
+                parts.append(
+                    f'<td style="padding:3px 4px;text-align:center;{score_css_100(row["Indice"])}">'
+                    f'{row["Indice"]:.0f}</td>'
+                )
+                parts.append(f'<td style="padding:3px 4px;text-align:center">{row["Conf.%"]:.0f}</td>')
+                parts.append(f'<td style="padding:3px 4px;text-align:center;white-space:nowrap">{row["Heure"]}</td>')
+                pv = row["Pluie (mm)"]
+                if pd.isna(pv):
+                    parts.append('<td style="padding:3px 4px;text-align:center">—</td>')
+                else:
+                    parts.append(
+                        f'<td style="padding:3px 4px;text-align:center;{rain_mm_css(pv)}">{pv:.1f}</td>'
+                    )
+                for h in hcols:
+                    v = row[h]
+                    if pd.isna(v):
+                        parts.append('<td style="padding:3px 2px;text-align:center;color:rgba(128,128,128,.6)">—</td>')
+                    else:
+                        parts.append(
+                            f'<td style="padding:3px 2px;text-align:center;{score_css_100(v)}">{v:.0f}</td>'
+                        )
+                parts.append("</tr>")
+            parts.append("</tbody></table></div>")
+            return "".join(parts)
 
-        daily_styler = styled_score_table(
-            daily, ["Indice"] + hour_cols, rain_column="Pluie (mm)"
-        ).apply(_weekend_row_style, axis=1)
-
-        col_cfg = {
-            "Date": st.column_config.TextColumn(width="small"),
-            "Indice": st.column_config.NumberColumn(width="small"),
-            "Conf.%": st.column_config.NumberColumn(width="small"),
-            "Heure": st.column_config.TextColumn(width="small"),
-            "Pluie (mm)": st.column_config.NumberColumn(width="small"),
-        }
-        for h in hour_cols:
-            col_cfg[h] = st.column_config.NumberColumn(width="small")
-
-        st.dataframe(
-            daily_styler,
-            use_container_width=True,
-            hide_index=True,
-            column_config=col_cfg,
-        )
+        st.markdown(_daily_table_html(daily, hour_cols, is_weekend), unsafe_allow_html=True)
 
         st.markdown("### 🔍 Analyse détaillée")
         st.caption("Clique un jour pour voir le détail")
