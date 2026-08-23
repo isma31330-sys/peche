@@ -2067,9 +2067,22 @@ with tab_dashboard:
             st.markdown(html, unsafe_allow_html=True)
 
         if not day.empty:
-            best_day = day.sort_values("score", ascending=False).iloc[0]
+            day_sorted = day.sort_values("heure").reset_index(drop=True)
+            best_idx_in_day = int(day_sorted["score"].idxmax())
+
+            selected_heure = st.selectbox(
+                "Heure du créneau à détailler",
+                day_sorted["heure"].tolist(),
+                index=best_idx_in_day,
+                key=f"detail_heure_{chosen_date}",
+                help="Pré-sélectionné sur le meilleur moment de la journée ; choisis une autre heure pour comparer.",
+            )
+            best_day = day_sorted[day_sorted["heure"] == selected_heure].iloc[0]
+            is_best = selected_heure == day_sorted.loc[best_idx_in_day, "heure"]
+
             st.markdown(
-                f"#### {chosen_date} · meilleur moment {best_day['heure']} "
+                f"#### {chosen_date} · {best_day['heure']} "
+                f"{'(meilleur moment) ' if is_best else ''}"
                 f"→ **{best_day['score']:.0f}/100**"
             )
 
