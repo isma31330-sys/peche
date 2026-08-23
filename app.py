@@ -260,7 +260,15 @@ def safe_float(v, default=None):
 
 
 def clamp(x, lo=0.0, hi=10.0):
-    return max(lo, min(hi, float(x)))
+    x = float(x)
+    if math.isnan(x):
+        # Python : min(hi, nan) vaut silencieusement hi (pas nan), ce qui
+        # forcerait un score manquant/invalide au MAXIMUM au lieu de le
+        # signaler. On retourne plutôt une valeur neutre au milieu de
+        # l'échelle, cohérente avec les autres valeurs par défaut (5.0)
+        # utilisées ailleurs dans le moteur de score.
+        return (lo + hi) / 2
+    return max(lo, min(hi, x))
 
 
 def haversine(lat1, lon1, lat2, lon2):
@@ -1091,7 +1099,12 @@ def choose_best_window(df, species, technique, spot, tides_dict, carnet, shom_ds
             w["maree"] + 0.06 + w["courant"] + w["vent"] + w["houle"]
             + w["lumiere"] + w["eau"] + w["pression"] + w["historique"] + w["spot"]
         )
-        score = score / total_weight * 10
+        # Moyenne pondérée des sous-scores, chacun déjà sur une échelle 0–10.
+        # (Le score n'est multiplié par 10 qu'une seule fois, juste après,
+        # pour obtenir l'échelle finale 0–100 : le multiplier deux fois
+        # faisait saturer le clamp() et affichait quasi toujours 100/100,
+        # quelle que soit la qualité réelle des conditions.)
+        score = score / total_weight
         score = clamp(score, 0, 10) * 10
 
         flags = [
@@ -2109,6 +2122,20 @@ with tab_stats:
 # ============================================================
 with tab_sources:
     st.subheader("ℹ️ Données utilisées et limites")
+
+    with st.expander("🔧 Diagnostic marées (brut API)"):
+        st.caption(
+            "Sert à vérifier le format exact renvoyé par api-maree.fr — "
+            "utile si les phases de marée affichent 'Phase incomplète' de "
+            "façon inattendue."
+        )
+        st.write("Jours reçus :", sorted(tides_dict.keys()) if tides_dict else "Aucun")
+        if tides_dict:
+            first_day = sorted(tides_dict.keys())[0]
+            st.write(f"Exemple — {first_day} :")
+            st.json(tides_dict[first_day])
+        else:
+            st.warning("tides_dict est vide : la clé/le site ne renvoie rien exploitable.")
 
     st.markdown(
         """
