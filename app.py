@@ -1280,6 +1280,17 @@ def fetch_tides(site_slug, start_date, end_date):
 # redéploiement) : la donnée reste disponible même si le conteneur
 # Streamlit redémarre, et est partagée entre tes différents appareils.
 # -----------------------------
+def _df_to_json_records(df):
+    """Convertit un DataFrame en liste de dicts JSON-compatible :
+    - colonne 'time' (Timestamp pandas) -> chaîne ISO
+    - NaN -> None (le JSON strict de httpx refuse NaN/Infinity)
+    """
+    d = df.copy()
+    if "time" in d.columns:
+        d["time"] = d["time"].astype(str)
+    return d.where(pd.notnull(d), None).to_dict(orient="records")
+
+
 def _fetch_weather_cached(lat, lon, force=False):
     zone_key = f"{ZONE}_{round(float(lat), 2)}_{round(float(lon), 2)}"
     if not force:
@@ -1291,7 +1302,7 @@ def _fetch_weather_cached(lat, lon, force=False):
             return df
     df = fetch_weather(lat, lon)
     if not df.empty:
-        db.store_meteo_cache(zone_key, "meteo", df.to_dict(orient="records"), ttl_seconds=21600)
+        db.store_meteo_cache(zone_key, "meteo", _df_to_json_records(df), ttl_seconds=21600)
     return df
 
 
@@ -1306,7 +1317,7 @@ def _fetch_marine_cached(lat, lon, force=False):
             return df
     df = fetch_marine(lat, lon)
     if not df.empty:
-        db.store_meteo_cache(zone_key, "marine", df.to_dict(orient="records"), ttl_seconds=21600)
+        db.store_meteo_cache(zone_key, "marine", _df_to_json_records(df), ttl_seconds=21600)
     return df
 
 
@@ -1407,7 +1418,7 @@ def _load_shom_with_shared_cache(uploaded_file, zone, reference):
         ds, err = load_shom_dataset(f)
         if err:
             raise RuntimeError(err)
-        return {"kind": "txt", "records": ds["data"].to_dict(orient="records")}
+        return {"kind": "txt", "records": _df_to_json_records(ds["data"])}
 
     try:
         cached = db.load_shom_dataset_cached(uploaded_file, zone, reference, _process)
