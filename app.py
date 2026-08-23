@@ -2809,6 +2809,54 @@ with tab_shom:
                     )
                     fig = build_current_arrows_figure(hourly_fields, hours, spot["lat"], spot["lon"], tide_labels=tide_labels)
                     st.plotly_chart(fig, use_container_width=True)
+
+                    # --- Bandeau d'infos marée du jour affiché ---
+                    day_tide = tides_dict.get(viz_date, {})
+                    day_coef = day_tide.get("max_coef")
+                    day_extrema = sorted(
+                        day_tide.get("extrema", []), key=lambda x: str(x.get("time", ""))
+                    )
+
+                    def _fmt_extrema_times(extrema, type_code):
+                        heures = []
+                        for e in extrema:
+                            if e.get("type") != type_code:
+                                continue
+                            t = str(e.get("time", ""))
+                            heures.append(t.split("T")[-1][:5] if "T" in t else t)
+                        return ", ".join(heures) if heures else "—"
+
+                    pm_heures = _fmt_extrema_times(day_extrema, "PM")
+                    bm_heures = _fmt_extrema_times(day_extrema, "BM")
+                    port_label = (
+                        nearest_site.get("site_name") or nearest_site.get("name") or nearest_site.get("site_id")
+                        if nearest_site else "—"
+                    )
+                    dist_txt = f" ({nearest_dist_km:.0f} km)" if nearest_dist_km is not None else ""
+                    coef_label = f"{day_coef:.0f}" if isinstance(day_coef, (int, float)) else "—"
+
+                    st.markdown(
+                        '<div style="display:flex;flex-wrap:wrap;gap:10px;margin:10px 0">'
+                        f'<div style="background:rgba(21,101,192,.10);border-radius:10px;padding:10px 16px;flex:1;min-width:150px">'
+                        f'<div style="font-size:11px;opacity:.75">⚓ Port de référence (horaires)</div>'
+                        f'<div style="font-size:16px;font-weight:600">{port_label}{dist_txt}</div>'
+                        f'</div>'
+                        f'<div style="background:rgba(21,101,192,.10);border-radius:10px;padding:10px 16px;flex:1;min-width:120px">'
+                        f'<div style="font-size:11px;opacity:.75">🌊 Coefficient</div>'
+                        f'<div style="font-size:16px;font-weight:600">{coef_label}</div>'
+                        f'</div>'
+                        f'<div style="background:rgba(21,101,192,.10);border-radius:10px;padding:10px 16px;flex:1;min-width:150px">'
+                        f'<div style="font-size:11px;opacity:.75">⬆️ Pleine(s) mer(s)</div>'
+                        f'<div style="font-size:16px;font-weight:600">{pm_heures}</div>'
+                        f'</div>'
+                        f'<div style="background:rgba(21,101,192,.10);border-radius:10px;padding:10px 16px;flex:1;min-width:150px">'
+                        f'<div style="font-size:11px;opacity:.75">⬇️ Basse(s) mer(s)</div>'
+                        f'<div style="font-size:16px;font-weight:600">{bm_heures}</div>'
+                        f'</div>'
+                        '</div>',
+                        unsafe_allow_html=True,
+                    )
+
                     st.caption(
                         "⚠️ Limite connue : le bouton Lecture de Plotly joue la séquence une fois "
                         "puis s'arrête sur la dernière heure — reclique pour rejouer. Une boucle "
