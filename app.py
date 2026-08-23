@@ -540,6 +540,53 @@ def turbidity_index(wave_h, precip_mm_h):
     return clamp(wave_h * 3.0 + precip_mm_h * 1.5, 0, 10)
 
 
+# Échelle de Beaufort (OMM) : vitesse du vent (km/h) -> hauteur de vague
+# typique en mer ouverte (m). Sert à ESTIMER la houle au-delà de J+8,
+# limite dure de l'API marine Open-Meteo (forecast_days ≤ 8, alors que la
+# météo classique va jusqu'à 16 — voir fetch_marine()). Mieux qu'une
+# valeur neutre fixe, mais reste une estimation : ignore le fetch (la
+# distance parcourue par le vent) et la durée d'établissement de la mer,
+# donc peut surestimer en zone abritée (rade, baie) et sous-estimer une
+# houle d'ouest arrivée d'un système météo lointain sans vent local fort.
+_BEAUFORT_WIND_KMH = [0, 3, 9, 15, 24, 33, 44, 55, 68, 81, 95, 110, 130]
+_BEAUFORT_WAVE_M = [0, 0.1, 0.25, 0.8, 1.25, 2.25, 3.5, 4.75, 6.25, 8.5, 10.75, 13.75, 15]
+
+
+def estimate_wave_height_from_wind(wind_kmh):
+    if wind_kmh is None:
+        return None
+    w = max(0.0, float(wind_kmh))
+    if w >= _BEAUFORT_WIND_KMH[-1]:
+        return _BEAUFORT_WAVE_M[-1]
+    for i in range(1, len(_BEAUFORT_WIND_KMH)):
+        if w <= _BEAUFORT_WIND_KMH[i]:
+            x0, x1 = _BEAUFORT_WIND_KMH[i - 1], _BEAUFORT_WIND_KMH[i]
+            y0, y1 = _BEAUFORT_WAVE_M[i - 1], _BEAUFORT_WAVE_M[i]
+            t = (w - x0) / (x1 - x0) if x1 > x0 else 0.0
+            return y0 + t * (y1 - y0)
+    return _BEAUFORT_WAVE_M[-1]
+
+
+def estimate_sst(last_known_sst, last_known_air_temp, current_air_temp, damping=0.15):
+    """Estimation de la température de l'eau par PERSISTANCE (dernière
+    valeur mesurée/modélisée réelle) + une fraction amortie de la
+    tendance de température de l'air depuis ce dernier point connu.
+    La mer a une forte inertie thermique (couche de mélange) : elle ne
+    suit les variations de l'air que partiellement et avec retard. Un
+    damping de 0.15 signifie qu'un réchauffement de l'air de +2°C ne fait
+    bouger l'estimation de l'eau que d'environ +0.3°C sur l'horizon
+    considéré — un ordre de grandeur raisonnable à quelques jours, pas une
+    vraie modélisation thermodynamique (pas de bilan énergétique, de
+    profondeur de couche de mélange ni de brassage par le vent).
+    """
+    if last_known_sst is None:
+        return None
+    if last_known_air_temp is None or current_air_temp is None:
+        return last_known_sst
+    delta_air = current_air_temp - last_known_air_temp
+    return last_known_sst + damping * delta_air
+
+
 def light_score(dt_local, cloud, species, turbidity=None):
     hour = dt_local.hour + dt_local.minute / 60
     transition = (
@@ -1408,7 +1455,7 @@ def shom_field_at_hour(shom_ds, tides_dict, date_key, hour_int, reference, lat_c
     return merged[["lat", "lon", "u", "v", "speed_kn", "direction"]].reset_index(drop=True), None
 
 
-def build_current_arrows_figure(hourly_fields, hours, center_lat, center_lon, arrow_scale=0.006):
+def build_current_arrows_figure(hourly_fields, hours, center_lat, center_lon, arrow_scale=0.018):
     """Construit une figure Plotly (fond OpenStreetMap, pas de clé requise)
     avec une flèche par point de grille et une frame par heure, pour le
     lecteur d'animation (play/pause + curseur) de l'onglet SHOM.
@@ -1509,6 +1556,18 @@ def choose_best_window(df, species, technique, spot, tides_dict, carnet, shom_ds
     local_df["date_only"] = local_df["time"].dt.date
     today = datetime.now().date()
 
+    # Dernière SST réellement connue (mesure/modèle, pas une estimation),
+    # utilisée comme point de départ de la persistance au-delà de J+8
+    # (limite dure de l'API marine — voir estimate_sst()).
+    last_known_sst_value = None
+    last_known_air_temp = None
+    if "sea_surface_temperature" in local_df.columns:
+        sst_known = local_df.dropna(subset=["sea_surface_temperature"])
+        if not sst_known.empty:
+            last_row = sst_known.loc[sst_known["time"].idxmax()]
+            last_known_sst_value = safe_float(last_row.get("sea_surface_temperature"))
+            last_known_air_temp = safe_float(last_row.get("temperature_2m"))
+
     for _, r in local_df.iterrows():
         dt = r["time"]
         if dt.date() < today:
@@ -1525,18 +1584,25 @@ def choose_best_window(df, species, technique, spot, tides_dict, carnet, shom_ds
         phase_s, phase_desc, phase, _ = tide_phase_score(dt, extrema, species)
         coef_s = continuous_coef_score(coef, species)
 
+        wind_kmh_val = safe_float(r.get("wind_speed_10m"))
         wind_s, wind_desc = wind_to_score(
-            safe_float(r.get("wind_speed_10m")),
+            wind_kmh_val,
             safe_float(r.get("wind_direction_10m")),
             species,
         )
         wave_h_val = safe_float(r.get("wave_height"))
+        wave_h_estimated = False
+        if wave_h_val is None and wind_kmh_val is not None:
+            wave_h_val = estimate_wave_height_from_wind(wind_kmh_val)
+            wave_h_estimated = True
         wave_s, wave_desc = wave_score(
             wave_h_val,
-            safe_float(r.get("wave_period")),
+            None if wave_h_estimated else safe_float(r.get("wave_period")),
             species,
             spot,
         )
+        if wave_h_estimated and wave_h_val is not None:
+            wave_desc += " (estimé via vent, hors portée du modèle marine)"
         pressure_s, pressure_desc = pressure_score(
             safe_float(r.get("surface_pressure")),
             safe_float(r.get("pressure_delta_3h")),
@@ -1545,11 +1611,19 @@ def choose_best_window(df, species, technique, spot, tides_dict, carnet, shom_ds
             safe_float(r.get("pressure_delta_24h")),
         )
         water_temp_val = safe_float(r.get("sea_surface_temperature"))
+        water_estimated = False
+        if water_temp_val is None:
+            water_temp_val = estimate_sst(
+                last_known_sst_value, last_known_air_temp, safe_float(r.get("temperature_2m"))
+            )
+            water_estimated = water_temp_val is not None
         water_s, water_desc = water_score(
             water_temp_val,
-            safe_float(r.get("sst_delta_24h")),
+            None if water_estimated else safe_float(r.get("sst_delta_24h")),
             species,
         )
+        if water_estimated:
+            water_desc += " (estimé par persistance + inertie thermique)"
         precip_val = safe_float(r.get("precipitation"))
         turbidity = turbidity_index(wave_h_val, precip_val)
         light_s, light_desc = light_score(
@@ -1775,6 +1849,11 @@ def fetch_marine(lat, lon):
     url = (
         "https://marine-api.open-meteo.com/v1/marine"
         f"?latitude={lat}&longitude={lon}"
+        # Limite DURE de l'API marine Open-Meteo : forecast_days n'accepte
+        # que 0-8 (contre 0-16 pour la météo classique). Au-delà, soit la
+        # valeur est reclampée silencieusement, soit l'API renvoie une
+        # erreur 400 qui casserait TOUTE la récupération marine — donc on
+        # reste strictement à 8, le vrai maximum, pas un choix arbitraire.
         f"&hourly={variables}&forecast_days=8"
         "&timezone=Europe%2FParis&cell_selection=sea"
     )
@@ -1785,7 +1864,6 @@ def fetch_marine(lat, lon):
         return pd.DataFrame()
 
 
-@st.cache_data(ttl=3600)
 @st.cache_data(ttl=30 * 86400, show_spinner=False)
 def fetch_maree_sites():
     """Liste des sites/ports disponibles sur api-maree.fr (endpoint public,
@@ -1946,22 +2024,27 @@ with st.sidebar:
     spot = st.session_state["active_point"]
 
     st.divider()
-    st.header("🌊 Courants SHOM")
-    shom_reference = st.selectbox(
-        "Référence temporelle de l'atlas", ["PM", "BM"], index=0,
-        help="Le produit SHOM encode les échéances autour de la PM ou BM du port de référence de la grille."
-    )
-    shom_file = st.file_uploader(
-        "Importer les données SHOM Courants 2D",
-        type=None,
-        help=(
-            "Le plus simple : zippe tout le dossier téléchargé (ex. le "
-            "dossier '558' pour Bretagne Sud) et importe le .zip — les "
-            "fichiers de données SHOM n'ont pas d'extension (ex. "
-            "'BRETAGNE_SUD_558'), d'où l'acceptation de tout type de "
-            "fichier ici. TXT unique ou NetCDF (.nc) également acceptés."
-        ),
-    )
+    with st.expander("🌊 Courants SHOM (avancé)", expanded=False):
+        st.caption(
+            "La zone est chargée automatiquement depuis Supabase selon le "
+            "spot — n'utilise ceci que pour tester un fichier NetCDF ou une "
+            "zone pas encore envoyée en base."
+        )
+        shom_reference = st.selectbox(
+            "Référence temporelle de l'atlas", ["PM", "BM"], index=0,
+            help="Le produit SHOM encode les échéances autour de la PM ou BM du port de référence de la grille."
+        )
+        shom_file = st.file_uploader(
+            "Importer les données SHOM Courants 2D (optionnel)",
+            type=None,
+            help=(
+                "Le plus simple : zippe tout le dossier téléchargé (ex. le "
+                "dossier '558' pour Bretagne Sud) et importe le .zip — les "
+                "fichiers de données SHOM n'ont pas d'extension (ex. "
+                "'BRETAGNE_SUD_558'), d'où l'acceptation de tout type de "
+                "fichier ici. TXT unique ou NetCDF (.nc) également acceptés."
+            ),
+        )
 
 def _load_shom_with_shared_cache(uploaded_file, zone, reference):
     """Comme load_shom_dataset(), mais sert un cache partagé Supabase
@@ -2288,6 +2371,18 @@ with tab_dashboard:
         else:
             daily["pluie_jour_mm"] = None
 
+        # Températures min/max de l'air du jour — élément de confort, pas
+        # un critère de score.
+        if "temperature_2m" in df.columns:
+            temp_by_day = (
+                df.groupby("date")["temperature_2m"].agg(["max", "min"]).round(0)
+                .rename(columns={"max": "temp_max_c", "min": "temp_min_c"})
+            )
+            daily = daily.merge(temp_by_day, left_on="date", right_index=True, how="left")
+        else:
+            daily["temp_max_c"] = None
+            daily["temp_min_c"] = None
+
         # Indice heure par heure (00 à 23), une colonne par heure. En-têtes
         # raccourcis ("07" plutôt que "07:00") pour limiter la largeur totale.
         hour_pivot = df_score.pivot_table(index="date", columns="heure", values="score", aggfunc="first")
@@ -2304,12 +2399,16 @@ with tab_dashboard:
             "confiance": "Conf.%",
             "heure": "Heure",
             "pluie_jour_mm": "Pluie (mm)",
+            "temp_max_c": "T°max",
+            "temp_min_c": "T°min",
         })
         st.caption(
             "\"Pluie (mm)\" = cumul sur les 24h, même si le créneau retenu "
             "est sec (l'algorithme cherche la meilleure fenêtre, pas "
-            "forcément toute la journée). Colonnes 00-23 : indice heure par "
-            "heure (case vide = donnée indisponible). Week-ends surlignés."
+            "forcément toute la journée). \"T°max/min\" = température de "
+            "l'air du jour (confort, hors score). Colonnes 00-23 : indice "
+            "heure par heure (case vide = donnée indisponible). Week-ends "
+            "surlignés."
         )
 
         def _daily_table_html(df_daily, hcols, weekend_mask):
@@ -2320,8 +2419,9 @@ with tab_dashboard:
             donne un contrôle total du padding/largeur par colonne.
             """
             widths = {"Date": "50px", "Indice": "38px", "Conf.%": "42px",
-                      "Heure": "44px", "Pluie (mm)": "54px"}
-            cols = ["Date", "Indice", "Conf.%", "Heure", "Pluie (mm)"] + hcols
+                      "Heure": "44px", "Pluie (mm)": "54px",
+                      "T°max": "40px", "T°min": "40px"}
+            cols = ["Date", "Indice", "Conf.%", "Heure", "Pluie (mm)", "T°max", "T°min"] + hcols
             parts = [
                 '<div style="overflow-x:auto">'
                 '<table style="border-collapse:collapse;font-size:12px">'
@@ -2352,6 +2452,12 @@ with tab_dashboard:
                     parts.append(
                         f'<td style="padding:3px 4px;text-align:center;{rain_mm_css(pv)}">{pv:.1f}</td>'
                     )
+                for tcol in ("T°max", "T°min"):
+                    tv = row[tcol]
+                    if pd.isna(tv):
+                        parts.append('<td style="padding:3px 4px;text-align:center">—</td>')
+                    else:
+                        parts.append(f'<td style="padding:3px 4px;text-align:center">{tv:.0f}°</td>')
                 for h in hcols:
                     v = row[h]
                     if pd.isna(v):
@@ -2640,35 +2746,12 @@ with tab_shom:
         else:
             st.success("✅ Fichier SHOM importé manuellement, chargé et disponible pour le calcul horaire.")
         if isinstance(shom_ds, dict) and shom_ds.get("kind") == "txt":
-            st.write("Format : TXT SHOM")
-            st.write("Points chargés :", len(shom_ds["data"]))
-            st.dataframe(shom_ds["data"].head(20), use_container_width=True, hide_index=True)
+            st.write("Format : TXT SHOM ·", len(shom_ds["data"]), "points chargés")
         else:
             _ds = shom_ds["data"] if isinstance(shom_ds, dict) else shom_ds
             st.write("Format : NetCDF")
             st.write("Dimensions :", dict(_ds.sizes))
             st.write("Variables :", list(_ds.data_vars))
-
-        # Affiche le courant calculé au meilleur créneau et quelques créneaux proches.
-        if not df_score.empty:
-            st.markdown("### Courant SHOM sur les meilleurs créneaux")
-            rows = []
-            for _, rr in df_score.sort_values("score", ascending=False).head(12).iterrows():
-                ti = tides_dict.get(rr["date"], {})
-                cur = shom_current_at(shom_ds, spot["lat"], spot["lon"], rr["datetime"], ti, reference=shom_reference)
-                if cur:
-                    rows.append({
-                        "Créneau": rr["datetime"].strftime("%d/%m %H:%M"),
-                        "Indice": rr["score"],
-                        "Coef réel": cur["coef"],
-                        "Courant": f"{cur['speed_kn']:.2f} nd",
-                        "Direction": f"{cur['direction']:.0f}°",
-                        "Δ PM/BM": f"{cur['delta_h']:+.1f} h",
-                    })
-            if rows:
-                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-            else:
-                st.warning("Aucune valeur SHOM exploitable pour les créneaux affichés. Vérifie PM/BM et la zone couverte par le fichier.")
 
         # --- Visualisation dynamique : flèches de courant heure par heure ---
         st.markdown("### 🧭 Visualisation dynamique du courant")
