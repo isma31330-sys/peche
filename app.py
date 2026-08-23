@@ -6,15 +6,24 @@ import os
 from datetime import datetime, timedelta, date
 import time
 import math
+import re
+from io import BytesIO
+import zipfile
 from urllib.parse import quote
 from streamlit_folium import st_folium
 import folium
+try:
+    import xarray as xr
+except Exception:
+    xr = None
+
+import db_supabase as db
 
 # ============================================================
-# AIDE À LA DÉCISION PÊCHE V5.2
+# AIDE À LA DÉCISION PÊCHE V6.2
 # Bar & Daurade royale - Le Croisic / Sud Bretagne
 #
-# V5.2 :
+# V6.2 :
 # - profils espèce + technique
 # - 10 spots préconfigurés autour du Croisic (~20 km)
 # - météo 14 j, point de référence fixe par défaut
@@ -26,8 +35,13 @@ import folium
 # - score spécifique au spot / espèce / technique
 # - score de confiance
 # - recommandation automatique du meilleur créneau
-# - carnet de SESSIONS : succès et bredouilles
+# - carnet de SESSIONS + CAPTURES détaillées : succès et bredouilles
 # - statistiques personnelles
+# - stockage persistant Supabase (Postgres + Storage + Auth + RLS),
+#   indépendant du disque local Streamlit
+# - cache partagé Supabase pour les données SHOM et météo/marine
+#   prétraitées, pour éviter de retraiter/rappeler les API à chaque
+#   lancement
 #
 # IMPORTANT :
 # - Le courant Open-Meteo est une estimation modèle et ne remplace
@@ -39,16 +53,22 @@ import folium
 # ============================================================
 
 st.set_page_config(
-    page_title="Indice Pêche V5.2 — Bar & Daurade",
+    page_title="Indice Pêche V6.2 — Bar & Daurade",
     page_icon="🎣",
     layout="wide",
 )
 
+# Zone de référence utilisée comme clé de cache partagé (SHOM / météo).
+ZONE = "le_croisic"
+
+# L'appli s'arrête ici tant que l'utilisateur n'est pas connecté à Supabase.
+if not db.require_login_ui():
+    st.stop()
+
 # -----------------------------
 # Configuration
 # -----------------------------
-HEADERS = {"User-Agent": "IndicePecheV5/1.0"}
-CARNET_FILE = "carnet_peche_v5.json"
+HEADERS = {"User-Agent": "IndicePecheV6/1.0"}
 
 # Ne pas laisser une clé API en clair dans le code.
 # Streamlit Cloud : Settings > Secrets
@@ -598,7 +618,363 @@ def recommendation_for(species, technique, score, row, spot):
         return "Surfcasting léger : 60–90 g selon courant, bas de ligne 40–45/100, appât naturel."
 
 
-def choose_best_window(df, species, technique, spot, tides_dict, carnet):
+
+# -----------------------------
+# Courants SHOM 2D
+# -----------------------------
+def _find_coord_name(ds, candidates):
+    names = list(ds.coords) + list(ds.dims)
+    for c in candidates:
+        for n in names:
+            if n.lower() == c.lower():
+                return n
+    for n in names:
+        low = n.lower()
+        if any(c.lower() in low for c in candidates):
+            return n
+    return None
+
+
+def _find_var_name(ds, candidates):
+    for c in candidates:
+        for n in ds.data_vars:
+            if n.lower() == c.lower():
+                return n
+    for n in ds.data_vars:
+        low = n.lower()
+        if any(c.lower() in low for c in candidates):
+            return n
+    return None
+
+
+def _read_shom_txt_bytes(raw, filename="courants.txt"):
+    """Lecture tolérante des TXT SHOM Courants 2D.
+
+    Le produit officiel actuellement publié par le SHOM est en TXT ASCII/WGS84.
+    Les fichiers contiennent des points de courant et des échéances relatives à
+    PM/BM. Comme les vues peuvent avoir des structures de colonnes différentes,
+    on privilégie les noms de colonnes lorsqu'ils sont présents et on refuse de
+    deviner silencieusement une structure ambiguë.
+    """
+    # Détection encodage simple
+    txt = raw.decode("utf-8", errors="replace")
+    lines = txt.splitlines()
+    nonempty = [x.strip() for x in lines if x.strip() and not x.lstrip().startswith("#")]
+    if not nonempty:
+        raise ValueError("Fichier TXT vide.")
+
+    # Plusieurs séparateurs possibles dans les exports ASCII SHOM.
+    candidates = [r"\\s+", r"[;\\t]+", r"[,;\\t]+"]
+    best = None
+    for sep in candidates:
+        try:
+            df = pd.read_csv(BytesIO(raw), sep=sep, engine="python", comment="#")
+            if df.shape[1] >= 4:
+                best = df
+                break
+        except Exception:
+            pass
+
+    if best is None:
+        # Dernier essai sans en-tête : on ne garde que les lignes numériques.
+        rows = []
+        for line in nonempty:
+            parts = re.split(r"[;\\s,]+", line)
+            nums = []
+            for x in parts:
+                try:
+                    nums.append(float(x.replace(',', '.')))
+                except Exception:
+                    pass
+            if len(nums) >= 4:
+                rows.append(nums)
+        if not rows:
+            raise ValueError("Aucune ligne numérique exploitable trouvée dans le TXT SHOM.")
+        width = max(len(r) for r in rows)
+        best = pd.DataFrame([r + [float('nan')] * (width-len(r)) for r in rows])
+
+    best.columns = [str(c).strip().lower() for c in best.columns]
+    return best
+
+
+def _normalise_shom_columns(df):
+    """Normalise un tableau SHOM vers lat/lon/u/v/offset_h/coefficient."""
+    cols = list(df.columns)
+    def pick(words):
+        for w in words:
+            for c in cols:
+                if w == c or w in c:
+                    return c
+        return None
+
+    lat = pick(["latitude", "lat", "y"])
+    lon = pick(["longitude", "lon", "long", "x"])
+    u = pick(["u", "courant_u", "eastward", "est"])
+    v = pick(["v", "courant_v", "northward", "nord"])
+    offset = pick(["offset_h", "delta_h", "heure", "hour", "time_h", "echeance"])
+    coeff = pick(["coefficient", "coeff", "coef"])
+    phase = pick(["phase", "reference", "pm_bm", "type"])
+
+    # Les exports peuvent ne pas nommer U/V. On ne fait pas de déduction
+    # silencieuse à partir de colonnes numériques : mieux vaut demander un
+    # format identifiable que calculer un courant faux.
+    if not all([lat, lon, u, v]):
+        raise ValueError(
+            "Colonnes SHOM non reconnues. Le fichier doit permettre d'identifier "
+            "latitude, longitude, U et V. Ouvre le TXT et vérifie son en-tête."
+        )
+
+    out = pd.DataFrame({
+        "lat": pd.to_numeric(df[lat], errors="coerce"),
+        "lon": pd.to_numeric(df[lon], errors="coerce"),
+        "u": pd.to_numeric(df[u], errors="coerce"),
+        "v": pd.to_numeric(df[v], errors="coerce"),
+    })
+    out["offset_h"] = pd.to_numeric(df[offset], errors="coerce") if offset else float("nan")
+    out["coefficient"] = pd.to_numeric(df[coeff], errors="coerce") if coeff else float("nan")
+    out["phase"] = df[phase].astype(str) if phase else ""
+    out = out.dropna(subset=["lat", "lon", "u", "v"]).copy()
+    return out
+
+
+def load_shom_dataset(uploaded_file):
+    """Charge soit le NetCDF 2D, soit le TXT/ZIP du produit SHOM."""
+    if uploaded_file is None:
+        return None, None
+    raw = uploaded_file.getvalue()
+    name = uploaded_file.name.lower()
+
+    # NetCDF (produit/variante documenté par le SHOM)
+    if name.endswith((".nc", ".nc4", ".netcdf")):
+        if xr is None:
+            return None, "xarray/netCDF4 n'est pas installé."
+        try:
+            return {"kind": "netcdf", "data": xr.open_dataset(BytesIO(raw))}, None
+        except Exception as e:
+            return None, str(e)
+
+    # ZIP : le produit de téléchargement peut contenir plusieurs TXT de vues.
+    if name.endswith(".zip"):
+        try:
+            z = zipfile.ZipFile(BytesIO(raw))
+            frames = []
+            for info in z.infolist():
+                if info.is_dir() or not info.filename.lower().endswith(".txt"):
+                    continue
+                try:
+                    d = _normalise_shom_columns(_read_shom_txt_bytes(z.read(info), info.filename))
+                    d["source_file"] = info.filename
+                    frames.append(d)
+                except Exception:
+                    continue
+            if not frames:
+                raise ValueError("Aucun TXT SHOM exploitable trouvé dans le ZIP.")
+            return {"kind": "txt", "data": pd.concat(frames, ignore_index=True)}, None
+        except Exception as e:
+            return None, str(e)
+
+    if name.endswith(".txt"):
+        try:
+            df = _normalise_shom_columns(_read_shom_txt_bytes(raw, name))
+            return {"kind": "txt", "data": df}, None
+        except Exception as e:
+            return None, str(e)
+
+    return None, "Format SHOM attendu : .txt, .zip ou .nc/.nc4."
+
+
+def shom_current_at(ds, lat, lon, dt, tide_info, reference="PM"):
+    if ds is None:
+        return None
+    if isinstance(ds, dict) and ds.get("kind") == "txt":
+        return shom_current_txt(ds["data"], lat, lon, dt, tide_info, reference)
+    if isinstance(ds, dict) and ds.get("kind") == "netcdf":
+        ds = ds["data"]
+    """Retourne le courant SHOM au spot/heure.
+
+    Le SHOM fournit directement U/V pour les coefficients 45 et 95 et les
+    échéances relatives à la PM/BM. On n'effectue qu'une interpolation
+    linéaire du coefficient entre 45 et 95, puis une interpolation spatiale
+    dans la grille. Aucune modélisation du courant n'est créée ici.
+    """
+    if ds is None:
+        return None
+
+    lat_name = _find_coord_name(ds, ["latitude", "lat", "y"])
+    lon_name = _find_coord_name(ds, ["longitude", "lon", "x"])
+    time_name = _find_coord_name(ds, ["time", "echeance", "t"])
+    coeff_name = _find_coord_name(ds, ["coeff", "coefficient", "coef"])
+    u_name = _find_var_name(ds, ["u", "eastward_velocity", "current_u", "voz"])
+    v_name = _find_var_name(ds, ["v", "northward_velocity", "current_v", "von"])
+
+    if not all([lat_name, lon_name, time_name, coeff_name, u_name, v_name]):
+        return None
+
+    extrema = tide_info.get("extrema", []) if tide_info else []
+    if not extrema:
+        return None
+
+    # Choix de l'événement de référence (PM ou BM), puis calcul de l'échéance.
+    candidates = []
+    for e in extrema:
+        try:
+            et = pd.Timestamp(e["datetime"])
+            typ = str(e.get("type", "")).upper()
+            if reference == "PM" and "PM" not in typ:
+                continue
+            if reference == "BM" and "BM" not in typ:
+                continue
+            delta_h = (pd.Timestamp(dt) - et).total_seconds() / 3600.0
+            if -6.01 <= delta_h <= 6.01:
+                candidates.append((abs(delta_h), delta_h, et))
+        except Exception:
+            continue
+
+    if not candidates:
+        return None
+    _, delta_h, _ = min(candidates)
+
+    # Le SHOM documente des pas de 1h/30min/5min selon la grille.
+    try:
+        time_values = ds[time_name].values
+        # Le produit SHOM référence PM à 12:00 fictive, avec une origine
+        # 1950-01-01 06:00Z. Pour une coordonnée numérique, l'échéance
+        # vaut donc 720 minutes + delta_h*60.
+        if getattr(time_values, "dtype", None) is not None and str(time_values.dtype).startswith("datetime64"):
+            time_sel = pd.Timestamp("1950-01-01T12:00:00") + pd.to_timedelta(delta_h, unit="h")
+        else:
+            time_sel = 720.0 + delta_h * 60.0
+    except Exception:
+        return None
+
+    # Coefficient : interpolation linéaire 45 -> 95, sans extrapolation.
+    coef = safe_float(tide_info.get("max_coef"), 70)
+    coef_used = max(45.0, min(95.0, float(coef)))
+    try:
+        ds45 = ds.sel({coeff_name: 45}, method="nearest")
+        ds95 = ds.sel({coeff_name: 95}, method="nearest")
+        # Sélection temporelle puis spatiale.
+        def sample(d):
+            q = d
+            try:
+                q = q.sel({time_name: time_sel}, method="nearest")
+            except Exception:
+                # Cas où time est déjà une simple échéance numérique.
+                vals = q[time_name].values
+                idx = int(min(range(len(vals)), key=lambda i: abs(float(vals[i]) - delta_h)))
+                q = q.isel({time_name: idx})
+            # Le produit est surface ; si une dimension profondeur est
+            # présente, on prend la couche la plus proche de 0 m.
+            depth_name = _find_coord_name(q.to_dataset(name="_q"), ["depth", "profondeur", "z"])
+            if depth_name is not None and depth_name in q.dims:
+                try:
+                    q = q.sel({depth_name: 0}, method="nearest")
+                except Exception:
+                    q = q.isel({depth_name: 0})
+            try:
+                q = q.interp({lat_name: lat, lon_name: lon}, method="linear")
+            except Exception:
+                q = q.sel({lat_name: lat, lon_name: lon}, method="nearest")
+            return float(q.values.squeeze())
+
+        u45 = sample(ds45[u_name])
+        v45 = sample(ds45[v_name])
+        u95 = sample(ds95[u_name])
+        v95 = sample(ds95[v_name])
+        alpha = (coef_used - 45.0) / 50.0
+        u = u45 + alpha * (u95 - u45)
+        v = v45 + alpha * (v95 - v45)
+        speed = math.hypot(u, v)
+        # Direction vers laquelle porte le courant.
+        direction = (math.degrees(math.atan2(u, v)) + 360) % 360
+        return {
+            "u": u,
+            "v": v,
+            "speed_ms": speed,
+            "speed_kn": speed * 1.943844,
+            "direction": direction,
+            "coef": coef,
+            "coef_used": coef_used,
+            "delta_h": delta_h,
+            "reference": reference,
+        }
+    except Exception:
+        return None
+
+
+
+def shom_current_txt(df, lat, lon, dt, tide_info, reference="PM"):
+    """Courant SHOM TXT : interpolation spatiale minimale + coefficient 45/95.
+
+    Le produit donne les valeurs U/V aux échéances du cycle. Nous n'inventons
+    pas de courant : nous sélectionnons le point SHOM le plus proche et
+    interpolons uniquement entre les situations 45 et 95 quand elles sont
+    présentes. La conversion U/V -> vitesse/direction est purement géométrique.
+    """
+    if df is None or df.empty:
+        return None
+    extrema = tide_info.get("extrema", []) if tide_info else []
+    candidates=[]
+    for e in extrema:
+        try:
+            et=pd.Timestamp(e["datetime"]); typ=str(e.get("type","")).upper()
+            if reference == "PM" and "PM" not in typ: continue
+            if reference == "BM" and "BM" not in typ: continue
+            dh=(pd.Timestamp(dt)-et).total_seconds()/3600
+            if -6.01 <= dh <= 6.01: candidates.append((abs(dh),dh))
+        except Exception: pass
+    if not candidates: return None
+    _, dh=min(candidates)
+
+    d=df.copy()
+    # Certains exports ont le coefficient sous forme ME/VE plutôt que 45/95.
+    coef=safe_float(tide_info.get("max_coef"),70)
+    target=max(45.0,min(95.0,float(coef)))
+    if d["coefficient"].notna().any():
+        d45=d[d["coefficient"].sub(45).abs()<1e-6]
+        d95=d[d["coefficient"].sub(95).abs()<1e-6]
+        if d45.empty or d95.empty:
+            # Si une seule situation est fournie, ne pas extrapoler.
+            return None
+        def nearest(frame):
+            frame=frame.copy()
+            frame["dist"]=(frame["lat"]-lat)**2 + ((frame["lon"]-lon)*math.cos(math.radians(lat)))**2
+            # L'échéance est normalement en heures relatives à PM/BM.
+            if frame["offset_h"].notna().any(): frame["dist"] += (frame["offset_h"]-dh).fillna(99)**2
+            return frame.sort_values("dist").iloc[0]
+        a=nearest(d45); b=nearest(d95)
+        alpha=(target-45)/50
+        u=float(a.u)+alpha*(float(b.u)-float(a.u)); v=float(a.v)+alpha*(float(b.v)-float(a.v))
+    else:
+        # Pas de coefficient explicite : impossible de faire l'interpolation 45/95
+        return None
+    speed=math.hypot(u,v)
+    direction=(math.degrees(math.atan2(u,v))+360)%360
+    return {"u":u,"v":v,"speed_ms":speed,"speed_kn":speed*1.943844,
+            "direction":direction,"coef":coef,"coef_used":target,
+            "delta_h":dh,"reference":reference}
+
+def current_score_value(speed_ms, species):
+    if speed_ms is None:
+        return 5.0
+    if species == "Daurade royale":
+        if 0.15 <= speed_ms <= 0.65:
+            return 9.0
+        if 0.08 <= speed_ms < 0.15 or 0.65 < speed_ms <= 0.90:
+            return 7.0
+        if speed_ms < 0.08:
+            return 5.0
+        return 3.0
+    if 0.12 <= speed_ms <= 0.60:
+        return 9.0
+    if 0.05 <= speed_ms < 0.12 or 0.60 < speed_ms <= 0.85:
+        return 7.0
+    if speed_ms < 0.05:
+        return 5.0
+    return 3.0
+
+
+def choose_best_window(df, species, technique, spot, tides_dict, carnet, shom_ds=None, shom_reference="PM"):
     """Calcule un score par heure pour les prochaines 8 journées.
     On conserve les créneaux réellement disponibles dans les données."""
     rows = []
@@ -654,33 +1030,26 @@ def choose_best_window(df, species, technique, spot, tides_dict, carnet):
             carnet, spot["id"], species, technique, coef, dt
         )
 
-        current = safe_float(r.get("ocean_current_velocity"))
-        if current is None:
-            current_s = 5.0
-            current_desc = "Courant modèle indisponible"
+        shom_current = shom_current_at(
+            shom_ds, spot["lat"], spot["lon"], dt, tide_info, reference=shom_reference
+        )
+        if shom_current is not None:
+            current_s = current_score_value(shom_current["speed_ms"], species)
+            current_desc = (
+                f"SHOM {shom_current['speed_kn']:.2f} nd → {shom_current['direction']:.0f}°"
+            )
+            current_available = True
         else:
-            # km/h -> m/s ; pour la pêche, on cherche une plage exploitable,
-            # pas le maximum absolu.
-            cms = current / 3.6
-            if species == "Daurade royale":
-                if 0.15 <= cms <= 0.65:
-                    current_s = 9.0
-                elif 0.08 <= cms < 0.15 or 0.65 < cms <= 0.9:
-                    current_s = 7.0
-                elif cms < 0.08:
-                    current_s = 5.0
-                else:
-                    current_s = 3.0
+            current = safe_float(r.get("ocean_current_velocity"))
+            if current is None:
+                current_s = 5.0
+                current_desc = "Courant indisponible"
+                current_available = False
             else:
-                if 0.12 <= cms <= 0.60:
-                    current_s = 9.0
-                elif 0.05 <= cms < 0.12 or 0.60 < cms <= 0.85:
-                    current_s = 7.0
-                elif cms < 0.05:
-                    current_s = 5.0
-                else:
-                    current_s = 3.0
-            current_desc = f"{cms:.2f} m/s"
+                cms = current / 3.6
+                current_s = current_score_value(cms, species)
+                current_desc = f"Modèle {cms:.2f} m/s"
+                current_available = False
 
         w = SPECIES[species]["weights"]
         score = (
@@ -717,7 +1086,7 @@ def choose_best_window(df, species, technique, spot, tides_dict, carnet):
             max(0, (dt.date() - today).days),
             flags,
             hist_conf,
-            safe_float(r.get("ocean_current_velocity")) is not None,
+            current_available,
         )
 
         rows.append({
@@ -750,22 +1119,25 @@ def choose_best_window(df, species, technique, spot, tides_dict, carnet):
 
 
 # -----------------------------
-# Persistance carnet
+# Persistance carnet (Supabase)
 # -----------------------------
-def charger_carnet():
-    if not os.path.exists(CARNET_FILE):
-        return []
-    try:
-        with open(CARNET_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, list) else []
-    except Exception:
-        return []
-
-
-def sauvegarder_carnet(carnet):
-    with open(CARNET_FILE, "w", encoding="utf-8") as f:
-        json.dump(carnet, f, ensure_ascii=False, indent=2)
+def _carnet_from_sessions(sessions):
+    """Adapte les lignes `sessions` Supabase au format attendu par
+    historical_score()/choose_best_window() (espece, spot_id, coef,
+    nb_poissons, touches), sans toucher à ces fonctions.
+    """
+    out = []
+    for s in sessions:
+        cond = s.get("conditions") or {}
+        maree = cond.get("maree") or {}
+        out.append({
+            "espece": s.get("espece_ciblee"),
+            "spot_id": s.get("spot_id"),
+            "coef": maree.get("coefficient"),
+            "nb_poissons": s.get("nb_poissons", 0),
+            "touches": s.get("touches", 0),
+        })
+    return out
 
 
 # -----------------------------
@@ -903,25 +1275,106 @@ def fetch_tides(site_slug, start_date, end_date):
 
 
 # -----------------------------
+# Cache partagé Supabase (météo / marine)
+# Vient s'ajouter au @st.cache_data local (rapide, mais perdu à chaque
+# redéploiement) : la donnée reste disponible même si le conteneur
+# Streamlit redémarre, et est partagée entre tes différents appareils.
+# -----------------------------
+def _fetch_weather_cached(lat, lon, force=False):
+    zone_key = f"{ZONE}_{round(float(lat), 2)}_{round(float(lon), 2)}"
+    if not force:
+        cached = db.get_cached_meteo(zone_key, "meteo")
+        if cached is not None:
+            df = pd.DataFrame(cached)
+            if not df.empty and "time" in df.columns:
+                df["time"] = pd.to_datetime(df["time"])
+            return df
+    df = fetch_weather(lat, lon)
+    if not df.empty:
+        db.store_meteo_cache(zone_key, "meteo", df.to_dict(orient="records"), ttl_seconds=21600)
+    return df
+
+
+def _fetch_marine_cached(lat, lon, force=False):
+    zone_key = f"{ZONE}_{round(float(lat), 2)}_{round(float(lon), 2)}"
+    if not force:
+        cached = db.get_cached_meteo(zone_key, "marine")
+        if cached is not None:
+            df = pd.DataFrame(cached)
+            if not df.empty and "time" in df.columns:
+                df["time"] = pd.to_datetime(df["time"])
+            return df
+    df = fetch_marine(lat, lon)
+    if not df.empty:
+        db.store_meteo_cache(zone_key, "marine", df.to_dict(orient="records"), ttl_seconds=21600)
+    return df
+
+
+# -----------------------------
 # Interface
 # -----------------------------
-st.title("🎣 Indice de Pêche V5.2 — Bar & Daurade royale")
+st.title("🎣 Indice de Pêche V6.2 — Bar & Daurade royale")
 st.caption(
     "Le Croisic / Sud Bretagne · météo · marée · courant · houle · SST · historique personnel"
 )
 
-carnet = charger_carnet()
+# Une seule lecture Supabase pour la session Streamlit courante ; réutilisée
+# pour le score, l'onglet Carnet et l'onglet Statistiques.
+sessions_data = db.load_sessions()
+captures_data = db.load_captures()
+carnet = _carnet_from_sessions(sessions_data)
 
 with st.sidebar:
+    user = st.session_state.get("sb_user")
+    if user:
+        st.caption(f"Connecté : {user.email}")
+        if st.button("🚪 Se déconnecter"):
+            db.sign_out()
+            st.rerun()
+    st.divider()
+
     st.header("🎯 Ciblage")
     species = st.selectbox("Espèce", list(SPECIES.keys()))
     technique = st.selectbox("Technique", SPECIES[species]["techniques"])
 
     st.divider()
-    st.header("📍 Spot")
-    spot_names = [s["nom"] for s in SPOTS]
-    selected_spot_name = st.selectbox("Secteur", spot_names)
-    spot = next(s for s in SPOTS if s["nom"] == selected_spot_name)
+    st.header("📍 Zone de pêche")
+    zone_mode = st.radio("Mode", ["🏠 Zone habituelle", "🧳 Déplacement / vacances"], index=0)
+
+    if zone_mode == "🏠 Zone habituelle":
+        spot_names = [s["nom"] for s in SPOTS]
+        selected_spot_name = st.selectbox("Secteur", spot_names)
+        spot = next(s for s in SPOTS if s["nom"] == selected_spot_name)
+    else:
+        zone_name = st.text_input("Nom de la zone", value="Nouveau secteur")
+        vac_lat = st.number_input("Latitude", value=float(CENTER["lat"]), format="%.5f")
+        vac_lon = st.number_input("Longitude", value=float(CENTER["lon"]), format="%.5f")
+        spot = {
+            "id": "custom_" + re.sub(r"[^a-z0-9]+", "_", zone_name.lower()).strip("_")[:40],
+            "nom": zone_name, "lat": vac_lat, "lon": vac_lon,
+            "fond": "À renseigner", "orientation": 0, "exposition": "À renseigner",
+            "bar": 5, "daurade": 5,
+            "notes": "Spot personnalisé : compléter les caractéristiques locales.",
+            "techniques_bar": "À adapter", "techniques_daurade": "À adapter",
+        }
+
+    st.info(
+        f"**{spot['fond']}**\n\n"
+        f"Coordonnées : {spot['lat']:.5f}, {spot['lon']:.5f}\n\n"
+        f"{spot['notes']}"
+    )
+
+    st.divider()
+    st.header("🌊 Courants SHOM")
+    shom_reference = st.selectbox(
+        "Référence temporelle de l'atlas", ["PM", "BM"], index=0,
+        help="Le produit SHOM encode les échéances autour de la PM ou BM du port de référence de la grille."
+    )
+    shom_file = st.file_uploader(
+        "Importer le paquet SHOM Courants 2D (.zip/.txt/.nc)",
+        type=["zip", "txt", "nc", "nc4"],
+        help="Le produit officiel Courants 2D est diffusé gratuitement sous Licence Ouverte. Le produit actuellement publié est en TXT/WGS84 ; la variante NetCDF est aussi documentée par le SHOM."
+    )
 
     st.info(
         f"**{spot['fond']}**\n\n"
@@ -936,9 +1389,48 @@ with st.sidebar:
     value=False,
 )
 
+def _load_shom_with_shared_cache(uploaded_file, zone, reference):
+    """Comme load_shom_dataset(), mais sert un cache partagé Supabase
+    (table cache_shom) quand ce même paquet a déjà été traité par toi
+    ou par une session précédente — évite de reparser le ZIP à chaque
+    lancement.
+    Le cache ne couvre que le format TXT/ZIP (sérialisable en JSON) ;
+    le NetCDF continue d'être traité directement, sans mise en cache.
+    """
+    if uploaded_file is None:
+        return None, None
+
+    if uploaded_file.name.lower().endswith((".nc", ".nc4", ".netcdf")):
+        return load_shom_dataset(uploaded_file)
+
+    def _process(f):
+        ds, err = load_shom_dataset(f)
+        if err:
+            raise RuntimeError(err)
+        return {"kind": "txt", "records": ds["data"].to_dict(orient="records")}
+
+    try:
+        cached = db.load_shom_dataset_cached(uploaded_file, zone, reference, _process)
+    except Exception as e:
+        return None, str(e)
+
+    if cached is None:
+        return None, None
+    return {"kind": "txt", "data": pd.DataFrame(cached["records"])}, None
+
+
+# Chargement du fichier SHOM (si fourni), via le cache partagé Supabase.
+shom_ds, shom_error = _load_shom_with_shared_cache(shom_file, ZONE, shom_reference)
+if shom_error:
+    st.sidebar.error(f"Fichier SHOM illisible : {shom_error}")
+elif shom_ds is not None:
+    st.sidebar.success("✅ Courants SHOM chargés (cache partagé) : utilisés dans le score horaire")
+else:
+    st.sidebar.caption("Courants SHOM : importer le paquet TXT/ZIP (ou NetCDF si disponible) pour activer le calcul local.")
+
 # Par défaut, une seule cellule météo de référence au Croisic est utilisée.
 # Cela évite de multiplier les appels Open-Meteo lorsque l'on change de spot.
-if use_spot_coords:
+if zone_mode == "🧳 Déplacement / vacances" or use_spot_coords:
     lat_cible, lon_cible = spot["lat"], spot["lon"]
     st.sidebar.caption(
         "⚠️ Coordonnées exactes activées : peut générer une nouvelle requête API."
@@ -954,17 +1446,18 @@ else:
 # Contrôle des appels API
 # -----------------------------
 st.sidebar.divider()
+force_refresh = False
 if st.sidebar.button("🔄 Actualiser météo / mer"):
     fetch_weather.clear()
     fetch_marine.clear()
-    st.rerun()
+    force_refresh = True
 
 # -----------------------------
-# Chargement données
+# Chargement données (cache partagé Supabase)
 # -----------------------------
 with st.spinner("Chargement météo, mer et marées..."):
-    df_weather = fetch_weather(lat_cible, lon_cible)
-    df_marine = fetch_marine(lat_cible, lon_cible)
+    df_weather = _fetch_weather_cached(lat_cible, lon_cible, force=force_refresh)
+    df_marine = _fetch_marine_cached(lat_cible, lon_cible, force=force_refresh)
 
 if df_weather.empty:
     st.error(
@@ -1038,6 +1531,8 @@ df_score = choose_best_window(
     spot=spot,
     tides_dict=tides_dict,
     carnet=carnet,
+    shom_ds=shom_ds,
+    shom_reference=shom_reference,
 )
 
 # -----------------------------
@@ -1067,10 +1562,11 @@ if not df_score.empty:
 # -----------------------------
 # Tabs
 # -----------------------------
-tab_dashboard, tab_spots, tab_carnet, tab_stats, tab_sources = st.tabs(
+tab_dashboard, tab_spots, tab_shom, tab_carnet, tab_stats, tab_sources = st.tabs(
     [
         "📊 Indice & créneaux",
-        "🗺️ Carte des 10 spots",
+        "🗺️ Carte & spots",
+        "🌊 Courants SHOM",
         "📖 Carnet de sessions",
         "🧠 Analyse personnelle",
         "ℹ️ Données & limites",
@@ -1252,6 +1748,58 @@ with tab_spots:
     st.dataframe(spot_df, use_container_width=True, hide_index=True)
 
 # ============================================================
+# TAB SHOM
+# ============================================================
+with tab_shom:
+    st.subheader("🌊 Courants de marée SHOM 2D")
+    st.markdown(
+        "Le SHOM fournit les composantes **U/V** du courant de surface pour les "
+        "coefficients **45 et 95**, avec des échéances autour de la PM/BM. "
+        "Pour un coefficient réel entre 45 et 95, V6 interpole uniquement ces "
+        "deux situations, puis convertit U/V en vitesse et direction."
+    )
+    if shom_ds is None:
+        st.info(
+            "Importe le paquet **Courants de marée 2D** (.zip/.txt) dans la "
+            "barre latérale. Le produit SHOM est annoncé comme gratuit et sous "
+            "Licence Ouverte 2.0."
+        )
+        st.markdown("**Source SHOM :**")
+        st.markdown("urlPage officielle SHOM — Courants de marée 2Dhttps://diffusion.shom.fr/marees/courants-de-maree/courants2d/courants-2d.html")
+    else:
+        st.success("Fichier SHOM chargé et disponible pour le calcul horaire.")
+        if isinstance(shom_ds, dict) and shom_ds.get("kind") == "txt":
+            st.write("Format : TXT SHOM")
+            st.write("Points chargés :", len(shom_ds["data"]))
+            st.dataframe(shom_ds["data"].head(20), use_container_width=True, hide_index=True)
+        else:
+            _ds = shom_ds["data"] if isinstance(shom_ds, dict) else shom_ds
+            st.write("Format : NetCDF")
+            st.write("Dimensions :", dict(_ds.sizes))
+            st.write("Variables :", list(_ds.data_vars))
+
+        # Affiche le courant calculé au meilleur créneau et quelques créneaux proches.
+        if not df_score.empty:
+            st.markdown("### Courant SHOM sur les meilleurs créneaux")
+            rows = []
+            for _, rr in df_score.sort_values("score", ascending=False).head(12).iterrows():
+                ti = tides_dict.get(rr["date"], {})
+                cur = shom_current_at(shom_ds, spot["lat"], spot["lon"], rr["datetime"], ti, reference=shom_reference)
+                if cur:
+                    rows.append({
+                        "Créneau": rr["datetime"].strftime("%d/%m %H:%M"),
+                        "Indice": rr["score"],
+                        "Coef réel": cur["coef"],
+                        "Courant": f"{cur['speed_kn']:.2f} nd",
+                        "Direction": f"{cur['direction']:.0f}°",
+                        "Δ PM/BM": f"{cur['delta_h']:+.1f} h",
+                    })
+            if rows:
+                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            else:
+                st.warning("Aucune valeur SHOM exploitable pour les créneaux affichés. Vérifie PM/BM et la zone couverte par le fichier.")
+
+# ============================================================
 # TAB 3 : carnet de sessions
 # ============================================================
 with tab_carnet:
@@ -1260,106 +1808,153 @@ with tab_carnet:
         "Une bredouille est une donnée utile : elle permet au moteur d'apprendre "
         "qu'un créneau apparemment favorable n'a pas forcément produit de poisson."
     )
+    st.caption(
+        "Stockage : Supabase (persistant, accessible depuis n'importe quel appareil)."
+    )
 
-    with st.form("form_session"):
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            session_date = st.date_input("Date", value=date.today())
-            session_species = st.selectbox(
-                "Espèce ciblée",
-                list(SPECIES.keys()),
-                index=list(SPECIES.keys()).index(species),
-            )
-            session_spot = st.selectbox(
-                "Spot",
-                spot_names,
-                index=spot_names.index(selected_spot_name),
-            )
+    st.markdown("### ➕ Nouvelle session")
 
-        with c2:
-            start_time = st.time_input("Début")
-            end_time = st.time_input("Fin")
-            session_technique = st.text_input("Technique / leurre", technique)
-
-        with c3:
-            nb_poissons = st.number_input(
-                "Poissons pris", min_value=0, max_value=100, value=0
-            )
-            touches = st.number_input(
-                "Touches", min_value=0, max_value=200, value=0
-            )
-            decroches = st.number_input(
-                "Décrochés", min_value=0, max_value=200, value=0
-            )
-
-        c4, c5, c6 = st.columns(3)
-        with c4:
-            taille_max = st.number_input(
-                "Taille max (cm)", min_value=0.0, max_value=150.0, value=0.0
-            )
-        with c5:
-            poids_max = st.number_input(
-                "Poids max (kg)", min_value=0.0, max_value=30.0, value=0.0
-            )
-        with c6:
-            coef_session = st.number_input(
-                "Coefficient", min_value=0, max_value=120, value=70
-            )
-
-        comment = st.text_area(
-            "Observations",
-            placeholder="Poste, fond, appât/leurre, animation, courant, comportement des poissons..."
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        session_date = st.date_input("Date", value=date.today(), key="ns_date")
+        session_species = st.selectbox(
+            "Espèce ciblée",
+            list(SPECIES.keys()),
+            index=list(SPECIES.keys()).index(species),
+            key="ns_species",
+        )
+        session_spot = st.selectbox(
+            "Spot",
+            spot_names,
+            index=spot_names.index(selected_spot_name),
+            key="ns_spot",
         )
 
-        submit = st.form_submit_button("💾 Enregistrer la session")
+    with c2:
+        start_time = st.time_input("Début", key="ns_start")
+        end_time = st.time_input("Fin", key="ns_end")
+        session_technique = st.text_input("Technique / leurre", technique, key="ns_technique")
 
-        if submit:
-            chosen = next(s for s in SPOTS if s["nom"] == session_spot)
+    with c3:
+        touches = st.number_input("Touches", min_value=0, max_value=200, value=0, key="ns_touches")
+        decroches = st.number_input("Décrochés", min_value=0, max_value=200, value=0, key="ns_decroches")
+        coef_session = st.number_input("Coefficient", min_value=0, max_value=120, value=70, key="ns_coef")
 
-            entry = {
-                "date": session_date.strftime("%Y-%m-%d"),
-                "heure_debut": start_time.strftime("%H:%M"),
-                "heure_fin": end_time.strftime("%H:%M"),
-                "espece": session_species,
-                "spot_id": chosen["id"],
-                "spot": chosen["nom"],
-                "lat": chosen["lat"],
-                "lon": chosen["lon"],
+    comment = st.text_area(
+        "Observations",
+        placeholder="Poste, fond, appât/leurre, animation, courant, comportement des poissons...",
+        key="ns_comment",
+    )
+
+    st.markdown("#### 🐟 Poissons capturés")
+    st.caption("Laisse le tableau vide pour enregistrer une bredouille. Une ligne = un poisson.")
+    captures_df = st.data_editor(
+        pd.DataFrame(
+            columns=["espece", "heure", "taille_cm", "poids_kg", "leurre_appat", "observations"]
+        ),
+        num_rows="dynamic",
+        use_container_width=True,
+        hide_index=True,
+        key="ns_captures_editor",
+        column_config={
+            "espece": st.column_config.SelectboxColumn("Espèce", options=list(SPECIES.keys())),
+            "heure": st.column_config.TextColumn("Heure (HH:MM)"),
+            "taille_cm": st.column_config.NumberColumn("Taille (cm)", min_value=0.0, max_value=150.0),
+            "poids_kg": st.column_config.NumberColumn("Poids (kg)", min_value=0.0, max_value=30.0),
+            "leurre_appat": st.column_config.TextColumn("Leurre / appât"),
+            "observations": st.column_config.TextColumn("Observations"),
+        },
+    )
+
+    photos = st.file_uploader(
+        "Photos (optionnel — associées aux captures ci-dessus, dans l'ordre des lignes)",
+        type=["jpg", "jpeg", "png"],
+        accept_multiple_files=True,
+        key="ns_photos",
+    )
+
+    if st.button("💾 Enregistrer la session", key="ns_submit", type="primary"):
+        chosen = next(s for s in SPOTS if s["nom"] == session_spot)
+        captures_rows = captures_df.dropna(how="all").to_dict(orient="records")
+
+        photo_paths = []
+        for i, f in enumerate(photos or []):
+            fname = f"{session_date.strftime('%Y%m%d')}_{int(time.time())}_{i}_{f.name}"
+            try:
+                path = db.upload_photo(f.getvalue(), fname, f.type or "image/jpeg")
+                photo_paths.append(path)
+            except Exception as e:
+                st.warning(f"Photo non envoyée ({f.name}) : {e}")
+                photo_paths.append(None)
+
+        captures_payload = []
+        for i, c in enumerate(captures_rows):
+            captures_payload.append({
+                "espece": c.get("espece") or session_species,
+                "heure": (c.get("heure") or "").strip() or None,
+                "taille_cm": safe_float(c.get("taille_cm")),
+                "poids_kg": safe_float(c.get("poids_kg")),
+                "leurre_appat": c.get("leurre_appat"),
                 "technique": session_technique,
-                "nb_poissons": int(nb_poissons),
-                "touches": int(touches),
-                "decroches": int(decroches),
-                "taille_max_cm": float(taille_max),
-                "poids_max_kg": float(poids_max),
-                "coef": int(coef_session),
-                "commentaire": comment,
-                "created_at": datetime.now().isoformat(timespec="seconds"),
-            }
+                "photo_url": photo_paths[i] if i < len(photo_paths) else None,
+                "observations": c.get("observations"),
+            })
 
-            carnet.append(entry)
-            sauvegarder_carnet(carnet)
+        session_row = {
+            "date": session_date.strftime("%Y-%m-%d"),
+            "heure_debut": start_time.strftime("%H:%M"),
+            "heure_fin": end_time.strftime("%H:%M"),
+            # Référence aux 10 spots préconfigurés (ou à un secteur "custom_..."
+            # en mode vacances) — ce n'est PAS une clé étrangère vers la table
+            # `spots` Supabase, qui elle sert aux spots personnels additionnels.
+            "spot_id": chosen["id"],
+            "spot_nom": chosen["nom"],
+            "espece_ciblee": session_species,
+            "technique": session_technique,
+            "conditions": {"maree": {"coefficient": int(coef_session)}},
+            "nb_poissons": len(captures_payload),
+            "touches": int(touches),
+            "decroches": int(decroches),
+            "commentaire": comment,
+        }
+
+        try:
+            db.save_session(session_row, captures_payload)
             st.success("✅ Session enregistrée.")
             st.rerun()
+        except Exception as e:
+            st.error(f"Erreur d'enregistrement : {e}")
 
     st.divider()
+    st.markdown("### 📚 Historique")
 
-    if carnet:
-        df_c = pd.DataFrame(carnet)
+    if sessions_data:
+        df_c = pd.DataFrame(sessions_data)[
+            ["date", "heure_debut", "heure_fin", "espece_ciblee", "spot_nom",
+             "technique", "nb_poissons", "touches", "decroches", "commentaire"]
+        ]
         st.dataframe(df_c, use_container_width=True, hide_index=True)
 
         b1, b2 = st.columns(2)
         with b1:
-            if st.button("🗑️ Vider le carnet"):
-                try:
-                    os.remove(CARNET_FILE)
-                except FileNotFoundError:
-                    pass
+            options = {
+                s["id"]: f"{s['date']} — {s['spot_nom']} ({s['espece_ciblee']})"
+                for s in sessions_data
+            }
+            to_delete = st.selectbox(
+                "Session à supprimer",
+                options=list(options.keys()),
+                format_func=lambda i: options[i],
+                key="del_select",
+            )
+            if st.button("🗑️ Supprimer cette session"):
+                db.delete_session(to_delete)
                 st.rerun()
         with b2:
             st.download_button(
-                "⬇️ Télécharger le carnet JSON",
-                data=json.dumps(carnet, ensure_ascii=False, indent=2),
-                file_name="carnet_peche_v5.json",
+                "⬇️ Exporter le carnet (JSON)",
+                data=db.export_carnet_json(),
+                file_name="carnet_peche_export.json",
                 mime="application/json",
             )
     else:
@@ -1371,21 +1966,21 @@ with tab_carnet:
 with tab_stats:
     st.subheader("🧠 Analyse personnelle")
 
-    if not carnet:
+    if not sessions_data:
         st.warning("Enregistre au moins quelques sessions pour commencer l'apprentissage.")
     else:
-        df_c = pd.DataFrame(carnet)
+        df_s = pd.DataFrame(sessions_data)
+        df_s["coef"] = df_s["conditions"].apply(
+            lambda c: safe_float(((c or {}).get("maree") or {}).get("coefficient"))
+        )
+        df_s["prise"] = pd.to_numeric(df_s["nb_poissons"], errors="coerce").fillna(0) > 0
 
-        # Normalisation des colonnes anciennes éventuelles.
-        if "espece" not in df_c:
-            df_c["espece"] = "Bar"
-        if "nb_poissons" not in df_c:
-            df_c["nb_poissons"] = 0
-        if "coef" not in df_c:
-            df_c["coef"] = 70
+        df_cap = pd.DataFrame(captures_data) if captures_data else pd.DataFrame(
+            columns=["session_id", "espece", "taille_cm", "poids_kg"]
+        )
 
-        total_sessions = len(df_c)
-        successful = int((pd.to_numeric(df_c["nb_poissons"], errors="coerce").fillna(0) > 0).sum())
+        total_sessions = len(df_s)
+        successful = int(df_s["prise"].sum())
         success_rate = successful / total_sessions * 100 if total_sessions else 0
 
         m1, m2, m3 = st.columns(3)
@@ -1395,10 +1990,7 @@ with tab_stats:
 
         st.markdown("### 🐟 Résultats par espèce")
         grp = (
-            df_c.assign(
-                prise=pd.to_numeric(df_c["nb_poissons"], errors="coerce").fillna(0) > 0
-            )
-            .groupby("espece")
+            df_s.groupby("espece_ciblee")
             .agg(
                 sessions=("prise", "size"),
                 sessions_avec_poisson=("prise", "sum"),
@@ -1406,18 +1998,36 @@ with tab_stats:
                 coef_moyen=("coef", "mean"),
             )
             .reset_index()
+            .rename(columns={"espece_ciblee": "espece"})
         )
         grp["taux_reussite_%"] = (
             grp["sessions_avec_poisson"] / grp["sessions"] * 100
         ).round(1)
         st.dataframe(grp, use_container_width=True, hide_index=True)
 
+        if not df_cap.empty:
+            st.markdown("### 📏 Tailles / poids par espèce capturée")
+            cap_grp = (
+                df_cap.assign(
+                    taille_cm=pd.to_numeric(df_cap["taille_cm"], errors="coerce"),
+                    poids_kg=pd.to_numeric(df_cap["poids_kg"], errors="coerce"),
+                )
+                .groupby("espece")
+                .agg(
+                    poissons=("id", "count"),
+                    taille_moy_cm=("taille_cm", "mean"),
+                    taille_max_cm=("taille_cm", "max"),
+                    poids_moy_kg=("poids_kg", "mean"),
+                    poids_max_kg=("poids_kg", "max"),
+                )
+                .round(1)
+                .reset_index()
+            )
+            st.dataframe(cap_grp, use_container_width=True, hide_index=True)
+
         st.markdown("### 🗺️ Tes spots les plus rentables")
         spot_grp = (
-            df_c.assign(
-                prise=pd.to_numeric(df_c["nb_poissons"], errors="coerce").fillna(0) > 0
-            )
-            .groupby(["spot", "espece"])
+            df_s.groupby(["spot_nom", "espece_ciblee"])
             .agg(
                 sessions=("prise", "size"),
                 poissons=("nb_poissons", "sum"),
@@ -1435,32 +2045,30 @@ with tab_stats:
         )
 
         st.markdown("### 🌊 Coefficients observés")
-        coef_grp = (
-            df_c.assign(
-                prise=pd.to_numeric(df_c["nb_poissons"], errors="coerce").fillna(0) > 0,
-                coef_num=pd.to_numeric(df_c["coef"], errors="coerce"),
+        coef_valid = df_s.dropna(subset=["coef"])
+        if not coef_valid.empty:
+            coef_grp = (
+                coef_valid.groupby(pd.cut(
+                    coef_valid["coef"],
+                    bins=[0, 45, 60, 75, 90, 105, 120],
+                    include_lowest=True,
+                ))
+                .agg(
+                    sessions=("prise", "size"),
+                    sessions_avec_poisson=("prise", "sum"),
+                )
+                .reset_index()
             )
-            .dropna(subset=["coef_num"])
-            .groupby(pd.cut(
-                df_c.assign(coef_num=pd.to_numeric(df_c["coef"], errors="coerce"))["coef_num"],
-                bins=[0, 45, 60, 75, 90, 105, 120],
-                include_lowest=True,
-            ))
-            .agg(
-                sessions=("prise", "size"),
-                sessions_avec_poisson=("prise", "sum"),
-            )
-            .reset_index()
-        )
-        if not coef_grp.empty:
             coef_grp["taux_reussite_%"] = (
                 coef_grp["sessions_avec_poisson"]
                 / coef_grp["sessions"] * 100
             ).round(1)
             st.dataframe(coef_grp, use_container_width=True, hide_index=True)
+        else:
+            st.caption("Pas encore de coefficient renseigné sur tes sessions.")
 
         st.info(
-            "ℹ️ Le moteur V5 utilise actuellement un lissage statistique simple. "
+            "ℹ️ Le moteur V6 utilise actuellement un lissage statistique simple. "
             "Avec 20–50 sessions bien renseignées, on pourra passer à un modèle "
             "plus robuste (régression logistique / gradient boosting) sans "
             "changer le carnet de données."
@@ -1496,6 +2104,12 @@ with tab_sources:
 - Les sessions avec et sans poisson sont conservées.
 - Le moteur utilise un lissage simple pour éviter de surinterpréter une
   poignée de sorties.
+
+### Stockage
+- Carnet (sessions + captures + photos) : Supabase, persistant et privé
+  (RLS), accessible depuis n'importe quel appareil connecté à ton compte.
+- Données SHOM et météo/marine prétraitées : cache partagé Supabase, pour
+  éviter de retraiter le ZIP SHOM ou de rappeler les API à chaque lancement.
 """
     )
 
@@ -1508,17 +2122,25 @@ with tab_sources:
     )
 
     st.markdown("### 🔧 Configuration")
-    if API_KEY_MAREE:
-        st.success("API_KEY_MAREE détectée.")
-    else:
-        st.error("API_KEY_MAREE absente.")
+    cfg1, cfg2 = st.columns(2)
+    with cfg1:
+        if API_KEY_MAREE:
+            st.success("API_KEY_MAREE détectée.")
+        else:
+            st.error("API_KEY_MAREE absente.")
+    with cfg2:
+        try:
+            db.get_client()
+            st.success("Connexion Supabase OK.")
+        except Exception as e:
+            st.error(f"Supabase non configuré : {e}")
 
 # -----------------------------
 # Footer
 # -----------------------------
 st.divider()
 st.caption(
-    "Indice Pêche V5.2 — outil d'aide à la décision. "
+    "Indice Pêche V6.2 — outil d'aide à la décision. "
     "Un score élevé indique une combinaison de conditions plus proche "
     "des hypothèses du modèle ; il ne garantit pas une prise."
 )

@@ -1,8 +1,7 @@
 streamlit
 requests
 pandas
-numpy
-matplotlib
-folium
 streamlit-folium
-streamlit-geolocation
+folium
+xarray
+supabase
