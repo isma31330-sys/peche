@@ -483,10 +483,29 @@ def parse_extreme_datetime(ext):
         return None
 
 
+def _to_paris_aware(ts):
+    """Convertit un Timestamp en horaire Europe/Paris. S'il est déjà
+    localisé (autre fuseau), on le convertit ; s'il est naïf (cas des
+    horaires météo Open-Meteo), on suppose qu'il représente déjà une
+    heure locale Europe/Paris, comme le reste de l'application.
+    Évite les TypeError lors de la comparaison/soustraction entre
+    horaires météo (naïfs) et horaires de marée (localisés).
+    """
+    ts = pd.Timestamp(ts)
+    if ts.tzinfo is None:
+        return ts.tz_localize("Europe/Paris")
+    return ts.tz_convert("Europe/Paris")
+
+
 def tide_phase_score(dt, extrema, species):
     """Retourne score, description, phase, distance au dernier événement."""
     if not extrema:
         return 5.0, "Marée indisponible", "Inconnue", None
+
+    # `dt` (météo Open-Meteo) est naïf, tandis que parse_extreme_datetime()
+    # localise les horaires de marée en Europe/Paris : on aligne les deux
+    # pour permettre la comparaison.
+    dt = _to_paris_aware(dt)
 
     events = []
     for e in extrema:
@@ -824,7 +843,7 @@ def shom_current_at(ds, lat, lon, dt, tide_info, reference="PM"):
                 continue
             if reference == "BM" and "BM" not in typ:
                 continue
-            delta_h = (pd.Timestamp(dt) - et).total_seconds() / 3600.0
+            delta_h = (_to_paris_aware(dt) - _to_paris_aware(et)).total_seconds() / 3600.0
             if -6.01 <= delta_h <= 6.01:
                 candidates.append((abs(delta_h), delta_h, et))
         except Exception:
@@ -920,7 +939,7 @@ def shom_current_txt(df, lat, lon, dt, tide_info, reference="PM"):
             et=pd.Timestamp(e["datetime"]); typ=str(e.get("type","")).upper()
             if reference == "PM" and "PM" not in typ: continue
             if reference == "BM" and "BM" not in typ: continue
-            dh=(pd.Timestamp(dt)-et).total_seconds()/3600
+            dh=(_to_paris_aware(dt)-_to_paris_aware(et)).total_seconds()/3600
             if -6.01 <= dh <= 6.01: candidates.append((abs(dh),dh))
         except Exception: pass
     if not candidates: return None
