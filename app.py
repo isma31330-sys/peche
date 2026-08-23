@@ -288,6 +288,17 @@ def score_css_100(val):
     return "background-color:#ffcdd2;color:#8a1c1c"
 
 
+def styled_score_table(df, column):
+    """Applique score_css_100 sur une colonne, quelle que soit la version
+    de pandas : Styler.map (pandas >= 2.1) remplace Styler.applymap,
+    supprimé dans les versions plus récentes.
+    """
+    styler = df.style
+    if hasattr(styler, "map"):
+        return styler.map(score_css_100, subset=[column])
+    return styler.applymap(score_css_100, subset=[column])
+
+
 def haversine(lat1, lon1, lat2, lon2):
     R = 6371.0
     dlat = math.radians(lat2 - lat1)
@@ -1824,7 +1835,7 @@ with tab_dashboard:
 
         st.markdown("### 🏆 Meilleurs créneaux")
         st.dataframe(
-            top_display.style.applymap(score_css_100, subset=["Indice"]),
+            styled_score_table(top_display, "Indice"),
             use_container_width=True,
             hide_index=True,
         )
@@ -1847,7 +1858,7 @@ with tab_dashboard:
             "heure": "Meilleure heure",
         })
         st.dataframe(
-            daily.style.applymap(score_css_100, subset=["Indice"]),
+            styled_score_table(daily, "Indice"),
             use_container_width=True,
             hide_index=True,
         )
