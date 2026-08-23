@@ -273,20 +273,25 @@ def clamp(x, lo=0.0, hi=10.0):
 
 # Échelle de couleur partagée par TOUS les éléments colorés de l'interface
 # (tableaux, pastilles des boutons de jour, badges de détail) :
-# ≤50 = rouge plein (mauvais), 100 = vert plein (excellent),
+# ≤50 = rouge plein (mauvais), ≥90 = vert plein (excellent),
 # dégradé continu rouge → orange → vert entre les deux.
+# Le point de bascule vers le vert est fixé à 90 (pas 100) : en pratique les
+# scores dépassent rarement 90/100, donc réserver le vert au 100 exact
+# écrasait toute la plage réellement observée dans une même teinte orange.
 def _mix_rgb(c1, c2, t):
     return tuple(round(c1[i] + (c2[i] - c1[i]) * t) for i in range(3))
 
 
 def score_rgb_100(v):
     v = max(0.0, min(100.0, float(v)))
-    RED, ORANGE, GREEN = (229, 57, 53), (255, 152, 0), (67, 160, 71)
+    RED, ORANGE, GREEN = (211, 47, 47), (245, 124, 0), (56, 142, 60)
     if v <= 50:
         return RED
-    if v <= 75:
-        return _mix_rgb(RED, ORANGE, (v - 50) / 25)
-    return _mix_rgb(ORANGE, GREEN, (v - 75) / 25)
+    if v <= 72:
+        return _mix_rgb(RED, ORANGE, (v - 50) / 22)
+    if v <= 90:
+        return _mix_rgb(ORANGE, GREEN, (v - 72) / 18)
+    return GREEN
 
 
 def score_css_100(val):
@@ -295,19 +300,55 @@ def score_css_100(val):
         v = float(val)
     except Exception:
         return ""
+    if math.isnan(v):
+        return ""
     r, g, b = score_rgb_100(v)
     return f"background-color:rgb({r},{g},{b});color:#ffffff"
 
 
-def styled_score_table(df, column):
-    """Applique score_css_100 sur une colonne, quelle que soit la version
-    de pandas : Styler.map (pandas >= 2.1) remplace Styler.applymap,
-    supprimé dans les versions plus récentes.
+# Échelle simple (bandes, pas de dégradé) pour un cumul de pluie JOURNALIER
+# en mm. Calibrée sur la classification OMM de l'intensité horaire (faible
+# < 2 mm/h, modérée 2-7,6 mm/h, forte > 7,6 mm/h) et sur le repère français
+# de cumul "abondant" à partir de 40 mm/24h, ramenés à une tolérance
+# personnelle : de faibles averses restent vertes, au-delà ça devient rouge.
+def rain_mm_css(val):
+    try:
+        v = float(val)
+    except Exception:
+        return ""
+    if math.isnan(v):
+        return ""
+    if v <= 3:
+        return "background-color:#43a047;color:#ffffff"
+    if v <= 10:
+        return "background-color:#ff9800;color:#ffffff"
+    return "background-color:#e53935;color:#ffffff"
+
+
+def styled_score_table(df, columns, rain_column=None):
+    """Applique score_css_100 sur une ou plusieurs colonnes (Indice, heures),
+    et rain_mm_css sur la colonne de pluie journalière le cas échéant.
+    Compatible Styler.map (pandas >= 2.1) et l'ancien Styler.applymap.
+    Formate aussi l'affichage (0 décimale pour les scores, 1 pour la pluie) :
+    sans .format() explicite, Styler affiche la précision flottante brute
+    (ex. "78.200000" au lieu de "78").
     """
+    if isinstance(columns, str):
+        columns = [columns]
     styler = df.style
-    if hasattr(styler, "map"):
-        return styler.map(score_css_100, subset=[column])
-    return styler.applymap(score_css_100, subset=[column])
+    mapper = styler.map if hasattr(styler, "map") else styler.applymap
+    styler = mapper(score_css_100, subset=columns)
+    fmt = {c: "{:.0f}" for c in columns}
+    if rain_column and rain_column in df.columns:
+        mapper2 = styler.map if hasattr(styler, "map") else styler.applymap
+        styler = mapper2(rain_mm_css, subset=[rain_column])
+        fmt[rain_column] = "{:.1f}"
+    # Format par défaut (1 décimale) pour toute colonne numérique non listée
+    # ci-dessus, avant d'appliquer les formats spécifiques : évite le même
+    # problème de précision flottante brute sur des colonnes comme "Coef".
+    styler = styler.format(precision=1, na_rep="—")
+    styler = styler.format(fmt, na_rep="—")
+    return styler
 
 
 def haversine(lat1, lon1, lat2, lon2):
@@ -1876,6 +1917,12 @@ with tab_dashboard:
         else:
             daily["pluie_jour_mm"] = None
 
+        # Indice heure par heure (00:00 à 23:00), une colonne par heure.
+        hour_pivot = df_score.pivot_table(index="date", columns="heure", values="score", aggfunc="first")
+        hour_cols = sorted(hour_pivot.columns)
+        hour_pivot = hour_pivot.reindex(columns=hour_cols)
+        daily = daily.merge(hour_pivot, left_on="date", right_index=True, how="left")
+
         daily["date"] = pd.to_datetime(daily["date"]).dt.strftime("%d/%m")
         daily = daily.rename(columns={
             "date": "Date",
@@ -1887,10 +1934,11 @@ with tab_dashboard:
         st.caption(
             "\"Pluie du jour\" = cumul sur les 24h, même si le créneau retenu "
             "ci-dessus est sec (l'algorithme cherche la meilleure fenêtre, "
-            "pas forcément toute la journée)."
+            "pas forcément toute la journée). Colonnes 00:00-23:00 : indice "
+            "heure par heure (case vide = donnée indisponible pour cette heure)."
         )
         st.dataframe(
-            styled_score_table(daily, "Indice"),
+            styled_score_table(daily, ["Indice"] + hour_cols, rain_column="Pluie du jour (mm)"),
             use_container_width=True,
             hide_index=True,
         )
