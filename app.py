@@ -271,6 +271,23 @@ def clamp(x, lo=0.0, hi=10.0):
     return max(lo, min(hi, x))
 
 
+# Seuils partagés par TOUS les éléments colorés de l'interface (tableaux,
+# pastilles des boutons de jour, badges de détail) : un dégradé continu
+# rendait les notes moyennes (~50) trop proches du jaune neutre, alors
+# qu'une note de 50/100 doit clairement se lire comme défavorable.
+def score_css_100(val):
+    """Couleur de fond/texte pour une note sur 100 (bandes, pas dégradé)."""
+    try:
+        v = float(val)
+    except Exception:
+        return ""
+    if v >= 65:
+        return "background-color:#c8e6c9;color:#1b5e20"
+    if v >= 40:
+        return "background-color:#ffe0b2;color:#8a5300"
+    return "background-color:#ffcdd2;color:#8a1c1c"
+
+
 def haversine(lat1, lon1, lat2, lon2):
     R = 6371.0
     dlat = math.radians(lat2 - lat1)
@@ -1487,59 +1504,12 @@ with st.sidebar:
     species = st.selectbox("Espèce", list(SPECIES.keys()))
     technique = st.selectbox("Technique", SPECIES[species]["techniques"])
 
-    st.divider()
-    st.header("📍 Zone de pêche")
-    zone_mode = st.radio("Mode", ["🏠 Zone habituelle", "🧳 Déplacement / vacances"], index=0)
-
-    if zone_mode == "🏠 Zone habituelle":
-        spot_names = [s["nom"] for s in SPOTS]
-        # Index par défaut piloté par le dernier clic sur la carte (onglet
-        # Carte & spots), le cas échéant.
-        default_spot_id = st.session_state.get("selected_spot_id", SPOTS[0]["id"])
-        default_index = next(
-            (i for i, s in enumerate(SPOTS) if s["id"] == default_spot_id), 0
-        )
-        selected_spot_name = st.selectbox(
-            "Secteur", spot_names, index=default_index, key="sidebar_spot_select"
-        )
-        spot = next(s for s in SPOTS if s["nom"] == selected_spot_name)
-        st.session_state["selected_spot_id"] = spot["id"]
-    else:
-        zone_name = st.text_input("Nom de la zone", value="Nouveau secteur")
-        if "vac_lat" not in st.session_state:
-            st.session_state["vac_lat"] = float(CENTER["lat"])
-        if "vac_lon" not in st.session_state:
-            st.session_state["vac_lon"] = float(CENTER["lon"])
-
-        vac_lat = st.number_input("Latitude", format="%.5f", key="vac_lat")
-        vac_lon = st.number_input("Longitude", format="%.5f", key="vac_lon")
-
-        with st.expander("🗺️ Choisir sur la carte"):
-            vac_map = folium.Map(location=[vac_lat, vac_lon], zoom_start=6)
-            folium.Marker([vac_lat, vac_lon], tooltip="Position actuelle").add_to(vac_map)
-            vac_map_data = st_folium(vac_map, height=300, width="100%", key="vac_map_widget")
-            if vac_map_data and vac_map_data.get("last_clicked"):
-                new_lat = round(vac_map_data["last_clicked"]["lat"], 5)
-                new_lon = round(vac_map_data["last_clicked"]["lng"], 5)
-                if (new_lat, new_lon) != (round(vac_lat, 5), round(vac_lon, 5)):
-                    st.session_state["vac_lat"] = new_lat
-                    st.session_state["vac_lon"] = new_lon
-                    st.rerun()
-
-        spot = {
-            "id": "custom_" + re.sub(r"[^a-z0-9]+", "_", zone_name.lower()).strip("_")[:40],
-            "nom": zone_name, "lat": vac_lat, "lon": vac_lon,
-            "fond": "À renseigner", "orientation": 0, "exposition": "À renseigner",
-            "bar": 5, "daurade": 5,
-            "notes": "Spot personnalisé : compléter les caractéristiques locales.",
-            "techniques_bar": "À adapter", "techniques_daurade": "À adapter",
-        }
-
-    st.info(
-        f"**{spot['fond']}**\n\n"
-        f"Coordonnées : {spot['lat']:.5f}, {spot['lon']:.5f}\n\n"
-        f"{spot['notes']}"
-    )
+    # Le point analysé (spot connu ou secteur cliqué librement) se choisit
+    # désormais sur la carte en haut de l'onglet "Indice & créneaux" — plus
+    # de distinction "zone habituelle" / "vacances" à gérer ici.
+    if "active_point" not in st.session_state:
+        st.session_state["active_point"] = dict(SPOTS[0])
+    spot = st.session_state["active_point"]
 
     st.divider()
     st.header("🌊 Courants SHOM")
@@ -1552,19 +1522,6 @@ with st.sidebar:
         type=["zip", "txt", "nc", "nc4"],
         help="Le produit officiel Courants 2D est diffusé gratuitement sous Licence Ouverte. Le produit actuellement publié est en TXT/WGS84 ; la variante NetCDF est aussi documentée par le SHOM."
     )
-
-    st.info(
-        f"**{spot['fond']}**\n\n"
-        f"Orientation : {spot['orientation']}°\n\n"
-        f"{spot['notes']}"
-    )
-
-    st.divider()
-    st.header("🗺️ Position météo")
-    use_spot_coords = st.checkbox(
-    "Utiliser les coordonnées exactes du spot",
-    value=False,
-)
 
 def _load_shom_with_shared_cache(uploaded_file, zone, reference):
     """Comme load_shom_dataset(), mais sert un cache partagé Supabase
@@ -1605,19 +1562,10 @@ elif shom_ds is not None:
 else:
     st.sidebar.caption("Courants SHOM : importer le paquet TXT/ZIP (ou NetCDF si disponible) pour activer le calcul local.")
 
-# Par défaut, une seule cellule météo de référence au Croisic est utilisée.
-# Cela évite de multiplier les appels Open-Meteo lorsque l'on change de spot.
-if zone_mode == "🧳 Déplacement / vacances" or use_spot_coords:
-    lat_cible, lon_cible = spot["lat"], spot["lon"]
-    st.sidebar.caption(
-        "⚠️ Coordonnées exactes activées : peut générer une nouvelle requête API."
-    )
-else:
-    lat_cible, lon_cible = CENTER["lat"], CENTER["lon"]
-    st.sidebar.caption(
-        f"Météo de référence : {CENTER['nom']} "
-        f"({CENTER['lat']:.4f}, {CENTER['lon']:.4f})"
-    )
+# La météo est toujours interrogée au point exact du secteur analysé
+# (spot connu ou point cliqué librement) — plus de cellule de référence
+# fixe sur Le Croisic à gérer séparément.
+lat_cible, lon_cible = spot["lat"], spot["lon"]
 
 # -----------------------------
 # Contrôle des appels API
@@ -1775,6 +1723,71 @@ tab_dashboard, tab_spots, tab_shom, tab_carnet, tab_stats, tab_sources = st.tabs
 # TAB 1 : dashboard
 # ============================================================
 with tab_dashboard:
+    st.markdown("### 🗺️ Zone analysée")
+    st.caption("Clique un repère pour un spot connu, ou n'importe où ailleurs pour une zone personnalisée.")
+
+    m_main = folium.Map(location=[spot["lat"], spot["lon"]], zoom_start=11, control_scale=True)
+    for s in SPOTS:
+        val = s["bar"] if species == "Bar" else s["daurade"]
+        is_active = s["id"] == spot.get("id")
+        color = "red" if is_active else ("green" if val >= 9 else ("orange" if val >= 8 else "blue"))
+        folium.Marker(
+            [s["lat"], s["lon"]],
+            tooltip=f"{s['nom']} — {val}/10",
+            icon=folium.Icon(color=color, icon="star" if is_active else "map-marker"),
+        ).add_to(m_main)
+    if str(spot.get("id", "")).startswith("point_"):
+        folium.Marker(
+            [spot["lat"], spot["lon"]],
+            tooltip=spot["nom"],
+            icon=folium.Icon(color="red", icon="map-pin"),
+        ).add_to(m_main)
+
+    main_map_data = st_folium(m_main, height=420, width="100%", key="main_point_map")
+
+    new_point = None
+    if main_map_data and main_map_data.get("last_object_clicked_tooltip"):
+        tt = main_map_data["last_object_clicked_tooltip"]
+        for s in SPOTS:
+            if tt.startswith(s["nom"]):
+                new_point = dict(s)
+                break
+    elif main_map_data and main_map_data.get("last_clicked"):
+        lat_c = main_map_data["last_clicked"]["lat"]
+        lon_c = main_map_data["last_clicked"]["lng"]
+        nearest_spot = min(SPOTS, key=lambda s: haversine(lat_c, lon_c, s["lat"], s["lon"]))
+        if haversine(lat_c, lon_c, nearest_spot["lat"], nearest_spot["lon"]) < 0.5:
+            new_point = dict(nearest_spot)
+        else:
+            new_point = {
+                "id": ("point_" + f"{round(lat_c, 4)}_{round(lon_c, 4)}").replace(".", "_").replace("-", "m"),
+                "nom": "Secteur personnalisé",
+                "lat": lat_c, "lon": lon_c,
+                "fond": "À renseigner", "orientation": 0, "exposition": "À renseigner",
+                "bar": 7, "daurade": 7,
+                "notes": "Secteur choisi sur la carte : caractéristiques locales à compléter.",
+                "techniques_bar": "À adapter", "techniques_daurade": "À adapter",
+            }
+
+    if new_point and new_point.get("id") != spot.get("id"):
+        st.session_state["active_point"] = new_point
+        st.rerun()
+
+    st.markdown(
+        f'<div style="display:inline-block;background:rgba(128,128,128,0.15);'
+        f'border-radius:20px;padding:6px 14px;font-size:13px;margin:4px 0">'
+        f'📍 {spot["nom"]} · {spot["lat"]:.4f}, {spot["lon"]:.4f}</div>',
+        unsafe_allow_html=True,
+    )
+    if API_KEY_MAREE and nearest_site:
+        site_label = nearest_site.get("site_name") or nearest_site.get("name") or nearest_site["site_id"]
+        dist_txt = f" ({nearest_dist_km:.0f} km)" if nearest_dist_km is not None else ""
+        st.caption(f"🌊 Port de marée utilisé pour les calculs : {site_label}{dist_txt}")
+    elif API_KEY_MAREE:
+        st.caption("🌊 Port de marée : aucun port trouvé pour cette zone.")
+
+    st.divider()
+
     if df_score.empty:
         st.warning("Pas assez de données pour calculer les créneaux.")
     else:
@@ -1811,9 +1824,7 @@ with tab_dashboard:
 
         st.markdown("### 🏆 Meilleurs créneaux")
         st.dataframe(
-            top_display.style.background_gradient(
-                subset=["Indice"], cmap="RdYlGn", vmin=0, vmax=100
-            ),
+            top_display.style.applymap(score_css_100, subset=["Indice"]),
             use_container_width=True,
             hide_index=True,
         )
@@ -1836,9 +1847,7 @@ with tab_dashboard:
             "heure": "Meilleure heure",
         })
         st.dataframe(
-            daily.style.background_gradient(
-                subset=["Indice"], cmap="RdYlGn", vmin=0, vmax=100
-            ),
+            daily.style.applymap(score_css_100, subset=["Indice"]),
             use_container_width=True,
             hide_index=True,
         )
@@ -1966,8 +1975,7 @@ with tab_spots:
         "Vérifie l'accès, les concessions, les réserves, la réglementation "
         "locale et les conditions de sécurité avant de pêcher."
     )
-
-    st.caption("👆 Clique un repère pour l'utiliser comme secteur actif.")
+    st.caption("Pour changer de secteur actif, utilise la carte en haut de l'onglet \"Indice & créneaux\".")
 
     m = folium.Map(
         location=[CENTER["lat"], CENTER["lon"]],
@@ -1993,7 +2001,7 @@ with tab_spots:
 
     for s in SPOTS:
         val = s["bar"] if species == "Bar" else s["daurade"]
-        is_active = s["id"] == spot["id"]
+        is_active = s["id"] == spot.get("id")
         color = "red" if is_active else ("green" if val >= 9 else ("orange" if val >= 8 else "blue"))
         icon_name = "star" if is_active else "map-marker"
 
@@ -2014,25 +2022,7 @@ with tab_spots:
             icon=folium.Icon(color=color, icon=icon_name),
         ).add_to(m)
 
-    spots_map_data = st_folium(m, height=600, width="100%", key="spots_map")
-
-    clicked_spot_id = None
-    if spots_map_data and spots_map_data.get("last_object_clicked_tooltip"):
-        tooltip = spots_map_data["last_object_clicked_tooltip"]
-        for s in SPOTS:
-            if tooltip.startswith(s["nom"]):
-                clicked_spot_id = s["id"]
-                break
-    elif spots_map_data and spots_map_data.get("last_object_clicked"):
-        lat_c = spots_map_data["last_object_clicked"]["lat"]
-        lon_c = spots_map_data["last_object_clicked"]["lng"]
-        best = min(SPOTS, key=lambda s: haversine(lat_c, lon_c, s["lat"], s["lon"]))
-        if haversine(lat_c, lon_c, best["lat"], best["lon"]) < 0.5:
-            clicked_spot_id = best["id"]
-
-    if clicked_spot_id and clicked_spot_id != st.session_state.get("selected_spot_id"):
-        st.session_state["selected_spot_id"] = clicked_spot_id
-        st.rerun()
+    st_folium(m, height=600, width="100%", key="spots_map_readonly")
 
     spot_df = pd.DataFrame(
         [
@@ -2125,10 +2115,10 @@ with tab_carnet:
             index=list(SPECIES.keys()).index(species),
             key="ns_species",
         )
-        session_spot = st.selectbox(
+        session_spot_label = st.text_input(
             "Spot",
-            spot_names,
-            index=spot_names.index(selected_spot_name),
+            value=spot["nom"],
+            help="Pré-rempli avec le secteur actif (choisi sur la carte). Modifiable si besoin.",
             key="ns_spot",
         )
 
@@ -2176,7 +2166,7 @@ with tab_carnet:
     )
 
     if st.button("💾 Enregistrer la session", key="ns_submit", type="primary"):
-        chosen = next(s for s in SPOTS if s["nom"] == session_spot)
+        chosen = {"id": spot["id"], "nom": session_spot_label}
         captures_rows = captures_df.dropna(how="all").to_dict(orient="records")
 
         photo_paths = []
@@ -2395,6 +2385,33 @@ with tab_sources:
             st.json(tides_dict[first_day])
         else:
             st.warning("tides_dict est vide : la clé/le site ne renvoie rien exploitable.")
+
+    with st.expander("🔧 Diagnostic pluie / nébulosité (données brutes Open-Meteo)"):
+        st.caption(
+            "Sert à vérifier les valeurs de précipitations et de couverture "
+            "nuageuse réellement reçues, si l'indice pluie semble ne pas "
+            "refléter les prévisions."
+        )
+        if not df_score.empty and "date" in df.columns:
+            diag = (
+                df[["date", "precipitation", "cloud_cover"]]
+                .groupby("date")
+                .agg(
+                    precipitation_max_mm_h=("precipitation", "max"),
+                    precipitation_totale_mm=("precipitation", "sum"),
+                    nuages_moyen_pct=("cloud_cover", "mean"),
+                )
+                .round(2)
+                .reset_index()
+            )
+            st.dataframe(diag, use_container_width=True, hide_index=True)
+            st.caption(
+                "Rappel des seuils : pluie ≤0.05 mm/h = temps sec (score inchangé) · "
+                "≤0.5 = bruine (×0.9) · ≤2 = pluie légère (×0.55) · "
+                "≤5 = modérée (×0.3) · au-delà = forte (×0.15)."
+            )
+        else:
+            st.warning("Pas de données météo chargées pour l'instant.")
 
     st.markdown(
         """
