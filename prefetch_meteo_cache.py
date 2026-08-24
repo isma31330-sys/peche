@@ -1,38 +1,4 @@
-name: Pré-chargement cache météo/marine
-
-on:
-  schedule:
-    # Toutes les 4h (cache valide 6h côté appli, marge confortable)
-    - cron: "15 */4 * * *"
-  workflow_dispatch: {}  # permet aussi un lancement manuel depuis l'onglet Actions
-
-jobs:
-  prefetch:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Récupérer le dépôt
-        uses: actions/checkout@v4
-
-      - name: Installer Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-
-      - name: Installer les dépendances
-        run: pip install supabase requests
-
-      - name: Lancer le pré-chargement
-        env:
-          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
-          APP_EMAIL: ${{ secrets.APP_EMAIL }}
-          APP_PASSWORD: ${{ secrets.APP_PASSWORD }}
-        run: |
-          python prefetch_meteo_cache.py \
-            --url "$SUPABASE_URL" \
-            --key "$SUPABASE_ANON_KEY" \
-            --email "$APP_EMAIL" \
-            --password "$APP_PASSWORD""""
+"""
 prefetch_meteo_cache.py
 ========================
 Pré-remplit le cache météo/marine partagé Supabase (table cache_meteo) pour
