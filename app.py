@@ -1981,8 +1981,21 @@ def _fetch_weather_cached(lat, lon, force=False):
                 df["time"] = pd.to_datetime(df["time"])
             return df
     df = fetch_weather(lat, lon)
-    if not df.empty:
-        db.store_meteo_cache(zone_key, "meteo", _df_to_json_records(df), ttl_seconds=21600)
+    if df.empty:
+        # Échec en direct (ex. HTTP 429 — limite de requêtes côté
+        # hébergement, indépendante de l'utilisateur) : secours sur la
+        # dernière donnée connue, même périmée, plutôt qu'un écran vide.
+        stale, fetched_at = db.get_latest_cached_meteo(zone_key, "meteo")
+        if stale:
+            st.warning(
+                f"⚠️ Météo en direct indisponible pour l'instant — affichage "
+                f"des dernières données connues (récupérées le {fetched_at})."
+            )
+            df = pd.DataFrame(stale)
+            if not df.empty and "time" in df.columns:
+                df["time"] = pd.to_datetime(df["time"])
+        return df
+    db.store_meteo_cache(zone_key, "meteo", _df_to_json_records(df), ttl_seconds=21600)
     return df
 
 
@@ -1996,8 +2009,18 @@ def _fetch_marine_cached(lat, lon, force=False):
                 df["time"] = pd.to_datetime(df["time"])
             return df
     df = fetch_marine(lat, lon)
-    if not df.empty:
-        db.store_meteo_cache(zone_key, "marine", _df_to_json_records(df), ttl_seconds=21600)
+    if df.empty:
+        stale, fetched_at = db.get_latest_cached_meteo(zone_key, "marine")
+        if stale:
+            st.warning(
+                f"⚠️ Données marines en direct indisponibles pour l'instant — "
+                f"affichage des dernières données connues (récupérées le {fetched_at})."
+            )
+            df = pd.DataFrame(stale)
+            if not df.empty and "time" in df.columns:
+                df["time"] = pd.to_datetime(df["time"])
+        return df
+    db.store_meteo_cache(zone_key, "marine", _df_to_json_records(df), ttl_seconds=21600)
     return df
 
 
