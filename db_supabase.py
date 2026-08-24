@@ -75,14 +75,35 @@ def is_authenticated() -> bool:
 
 
 def require_login_ui():
-    """Bloc de connexion à afficher tant que l'utilisateur n'est pas authentifié.
+    """Connecte automatiquement via les identifiants stockés dans les
+    secrets Streamlit (APP_EMAIL / APP_PASSWORD) — appli personnelle
+    mono-utilisateur, pas besoin de ressaisir email/mot de passe à chaque
+    session. Si ces secrets sont absents ou la connexion échoue (mauvais
+    mot de passe, compte pas encore créé...), retombe sur le formulaire
+    manuel habituel, en secours.
     Retourne True si l'utilisateur est connecté (et l'app peut continuer),
     False sinon (dans ce cas, appeler st.stop() juste après dans l'app).
     """
     if is_authenticated():
         return True
 
+    app_email = st.secrets.get("APP_EMAIL")
+    app_password = st.secrets.get("APP_PASSWORD")
+    if app_email and app_password:
+        try:
+            sign_in(app_email, app_password)
+            if is_authenticated():
+                return True
+        except Exception:
+            pass  # identifiants invalides ou service indisponible : formulaire manuel ci-dessous
+
     st.title("🎣 Indice Pêche — Connexion")
+    if app_email and app_password:
+        st.caption(
+            "⚠️ La connexion automatique (APP_EMAIL/APP_PASSWORD dans les "
+            "secrets) a échoué — vérifie ces valeurs, ou connecte-toi "
+            "manuellement ci-dessous en attendant."
+        )
     tab_login, tab_signup = st.tabs(["Connexion", "Créer un compte"])
 
     with tab_login:
@@ -107,7 +128,9 @@ def require_login_ui():
                     sign_up(email_s, password_s)
                     st.success(
                         "Compte créé. Selon la config Supabase, une confirmation "
-                        "par email peut être nécessaire avant la première connexion."
+                        "par email peut être nécessaire avant la première connexion. "
+                        "Ajoute ensuite APP_EMAIL/APP_PASSWORD dans les secrets "
+                        "Streamlit pour une connexion automatique la prochaine fois."
                     )
                 except Exception as e:
                     st.error(f"Création impossible : {e}")
@@ -317,6 +340,27 @@ def get_cached_meteo(zone: str, type_: str) -> dict | None:
     return None
 
 
+def get_latest_cached_meteo(zone: str, type_: str):
+    """Dernière entrée en cache pour zone/type, MÊME EXPIRÉE — secours
+    quand une récupération en direct échoue (ex. Open-Meteo HTTP 429 côté
+    hébergement, indépendant de l'utilisateur). Retourne (data, fetched_at)
+    ou (None, None) si rien n'a jamais été mis en cache pour cette zone.
+    """
+    client = get_client()
+    res = (
+        client.table("cache_meteo")
+        .select("data,fetched_at")
+        .eq("zone", zone)
+        .eq("type", type_)
+        .order("fetched_at", desc=True)
+        .limit(1)
+        .execute()
+    )
+    if res.data:
+        return res.data[0]["data"], res.data[0]["fetched_at"]
+    return None, None
+
+
 def store_meteo_cache(zone: str, type_: str, data: dict, ttl_seconds: int = 21600):
     client = get_client()
     expires_at = (datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)).isoformat()
@@ -362,4 +406,3 @@ def get_shom_zones_for_point(lat: float, lon: float) -> list[dict]:
         .execute()
     )
     return res.data or []
-
