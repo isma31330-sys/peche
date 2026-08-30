@@ -1474,8 +1474,8 @@ def build_current_arrows_figure(hourly_fields, hours, center_lat, center_lon, ti
 
     def frame_traces(field_df):
         if field_df is None or field_df.empty:
-            return [go.Scattermapbox(lat=[], lon=[], mode="lines"),
-                    go.Scattermapbox(lat=[], lon=[], mode="markers")]
+            return [go.Scattermap(lat=[], lon=[], mode="lines"),
+                    go.Scattermap(lat=[], lon=[], mode="markers")]
         lats, lons = [], []
         for _, r in field_df.iterrows():
             length = r["speed_kn"] * arrow_scale
@@ -1484,12 +1484,12 @@ def build_current_arrows_figure(hourly_fields, hours, center_lat, center_lon, ti
             dlon = length * math.sin(rad) / max(0.2, math.cos(math.radians(r["lat"])))
             lats += [r["lat"], r["lat"] + dlat, None]
             lons += [r["lon"], r["lon"] + dlon, None]
-        line_trace = go.Scattermapbox(
+        line_trace = go.Scattermap(
             lat=lats, lon=lons, mode="lines",
             line=dict(width=2, color="#1565c0"),
             hoverinfo="skip", showlegend=False,
         )
-        tip_trace = go.Scattermapbox(
+        tip_trace = go.Scattermap(
             lat=field_df["lat"] + field_df["speed_kn"] * arrow_scale * np.cos(np.radians(field_df["direction"])),
             lon=field_df["lon"] + field_df["speed_kn"] * arrow_scale * np.sin(np.radians(field_df["direction"])) / max(0.2, math.cos(math.radians(center_lat))),
             mode="markers",
@@ -1510,7 +1510,7 @@ def build_current_arrows_figure(hourly_fields, hours, center_lat, center_lon, ti
 
     fig = go.Figure(data=init_traces, frames=frames)
     fig.update_layout(
-        mapbox=dict(style="open-street-map", center=dict(lat=center_lat, lon=center_lon), zoom=10.5),
+        map=dict(style="open-street-map", center=dict(lat=center_lat, lon=center_lon), zoom=10.5),
         margin=dict(l=0, r=0, t=0, b=0),
         height=520,
         updatemenus=[dict(
