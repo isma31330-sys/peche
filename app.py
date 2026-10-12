@@ -83,6 +83,7 @@ CENTER = {"lat": 47.2931, "lon": -2.5204, "nom": "Le Croisic"}
 SPOTS = [
     {
         "id": "croisic_cote_sauvage",
+        "type_poste": "pointe",
         "nom": "Pointe du Croisic / Côte sauvage",
         "lat": 47.2848, "lon": -2.5450,
         "fond": "Roche + sable / cassures",
@@ -95,6 +96,7 @@ SPOTS = [
     },
     {
         "id": "port_lin",
+        "type_poste": "mixte",
         "nom": "Port Lin / Castouillet",
         "lat": 47.2745, "lon": -2.5235,
         "fond": "Roche + sable",
@@ -107,6 +109,7 @@ SPOTS = [
     },
     {
         "id": "penchateau",
+        "type_poste": "pointe",
         "nom": "Pointe de Penchâteau — La Baule",
         "lat": 47.2560, "lon": -2.4260,
         "fond": "Roche + sable",
@@ -119,6 +122,7 @@ SPOTS = [
     },
     {
         "id": "govelle",
+        "type_poste": "mixte",
         "nom": "La Govelle / rochers",
         "lat": 47.2630, "lon": -2.4340,
         "fond": "Sable + rochers",
@@ -131,6 +135,7 @@ SPOTS = [
     },
     {
         "id": "turballe_musoir",
+        "type_poste": "digue",
         "nom": "La Turballe — digue / musoir",
         "lat": 47.3465, "lon": -2.5120,
         "fond": "Enrochements + sable",
@@ -143,6 +148,7 @@ SPOTS = [
     },
     {
         "id": "turballe_port",
+        "type_poste": "digue",
         "nom": "La Turballe — secteur port / Port Creux",
         "lat": 47.3485, "lon": -2.5070,
         "fond": "Roche + sable",
@@ -155,6 +161,7 @@ SPOTS = [
     },
     {
         "id": "piriac_castelli",
+        "type_poste": "pointe",
         "nom": "Piriac — Pointe de Castelli",
         "lat": 47.3790, "lon": -2.5445,
         "fond": "Roche + sable",
@@ -167,6 +174,7 @@ SPOTS = [
     },
     {
         "id": "piriac_grillades",
+        "type_poste": "mixte",
         "nom": "Piriac — Les Grillades",
         "lat": 47.3815, "lon": -2.5500,
         "fond": "Dalles rocheuses + sable",
@@ -179,6 +187,7 @@ SPOTS = [
     },
     {
         "id": "mesquer_kercabellec",
+        "type_poste": "estuaire",
         "nom": "Mesquer — Kercabellec",
         "lat": 47.3970, "lon": -2.4630,
         "fond": "Sable / vase + coquillages",
@@ -191,6 +200,7 @@ SPOTS = [
     },
     {
         "id": "penbron_traict",
+        "type_poste": "estuaire",
         "nom": "Pen-Bron — entrée du Traict",
         "lat": 47.3420, "lon": -2.5100,
         "fond": "Sable + coquillages + courant",
@@ -620,15 +630,29 @@ def light_score(dt_local, cloud, species, turbidity=None):
         if turbidity is not None and turbidity >= 5:
             sun_penalty_scale = 0.4
 
-        if 20 <= cloud <= 75:
-            # Couvert léger à modéré : lumière diffuse, souvent plus
-            # favorable qu'un grand soleil (moins de méfiance du poisson).
+        if cloud >= 20:
+            # Ciel couvert : lumière diffuse, moins de méfiance du poisson.
+            # Le guide « Pêche au bar au leurre » cite explicitement le ciel
+            # couvert comme favorable. L'ancienne version retirait 0,3 point
+            # au-delà de 90 % de nuages, en supposant à tort que cela
+            # signalait de la pluie : la pluie a déjà son propre facteur
+            # (rain_penalty), donc un ciel couvert SANS pluie n'est pas
+            # pénalisé.
             base += 0.6
         elif cloud < 15:
             # Ciel bien dégagé / grand soleil : lumière crue.
             base -= 0.4 * sun_penalty_scale
-        elif cloud > 90:
-            base -= 0.3
+
+        # Bar en plein jour : le guide indique que ça peut mordre « si le ciel
+        # est couvert ou la mer brassée », alors que soleil + mer d'huile sont
+        # presque toujours mauvais. On relève donc la base de la journée dans
+        # le premier cas seulement.
+        if (
+            species == "Bar"
+            and 9 <= hour <= 17
+            and (cloud >= 70 or (turbidity is not None and turbidity >= 4))
+        ):
+            base += 1.2
 
     return clamp(base), "Transition lumineuse" if transition else "Lumière standard"
 
@@ -657,25 +681,78 @@ def rain_penalty(precip_mm):
         return 0.15, f"Forte pluie ({p:.1f} mm/h)"
 
 
-def continuous_coef_score(coef, species):
+def _interp(x, anchors):
+    """Interpolation linéaire par morceaux sur une liste d'ancres
+    [(x, y), ...] triée par x. Hors bornes : valeur de l'ancre extrême."""
+    if x <= anchors[0][0]:
+        return anchors[0][1]
+    for (x0, y0), (x1, y1) in zip(anchors, anchors[1:]):
+        if x <= x1:
+            t = (x - x0) / (x1 - x0) if x1 > x0 else 0.0
+            return y0 + t * (y1 - y0)
+    return anchors[-1][1]
+
+
+def spot_type_of(spot):
+    """Type de poste ('pointe', 'plage', 'estuaire', 'digue', 'mixte') ou
+    None pour un point cliqué librement sur la carte. Retombe sur la liste
+    SPOTS par identifiant si la clé manque (session ouverte avant l'ajout
+    du champ)."""
+    if not spot:
+        return None
+    t = spot.get("type_poste")
+    if t:
+        return t
+    sid = spot.get("id")
+    for s in SPOTS:
+        if s["id"] == sid:
+            return s.get("type_poste")
+    return None
+
+
+# Coefficient du bar selon le type de poste. Source : guides Carnet de Pêche
+# (« Les meilleurs coefficients pour pêcher le bar », « Pêche au bar au
+# leurre », « Les meilleurs spots de pêche en Bretagne »). Les guides donnent
+# des FOURCHETTES qualitatives, pas des notes : les ancres ci-dessous sont
+# ma quantification de ces fourchettes, à ajuster avec ton carnet.
+#  - générique : zone idéale 70-95 (cœur 75-90), au-delà de 100 souvent
+#    décevant (eau sale, poste difficile), mortes-eaux = « un autre jeu ».
+#  - pointe / veine de courant : 80+ (un coef 95 est une bénédiction), mais
+#    >100 ingérable/dangereux sur plusieurs pointes bretonnes.
+#  - plage : 55-80, roi 65-75, au-dessus de 85-90 eau souvent impêchable au
+#    leurre.
+#  - estuaire : 60-85, roi ~70, au-delà de 90 eau illisible.
+BAR_COEF_ANCHORS = {
+    "generic": [(20, 3.5), (35, 4.5), (45, 5.5), (55, 7.0), (70, 9.0), (75, 10.0),
+                (90, 10.0), (95, 9.0), (100, 7.5), (105, 6.0), (110, 5.0), (120, 3.5)],
+    "pointe": [(20, 2.5), (45, 4.0), (60, 5.5), (70, 7.5), (80, 10.0), (95, 10.0),
+               (100, 9.0), (105, 7.5), (115, 5.5), (120, 4.5)],
+    "plage": [(20, 3.0), (35, 4.0), (45, 5.5), (55, 8.0), (65, 10.0), (75, 10.0),
+              (80, 9.0), (90, 6.5), (100, 4.5), (110, 3.5), (120, 3.0)],
+    "estuaire": [(20, 3.0), (35, 4.0), (45, 5.5), (60, 8.5), (70, 10.0), (80, 9.5),
+                 (85, 8.5), (90, 6.5), (100, 4.0), (110, 3.0), (120, 2.5)],
+}
+
+
+def continuous_coef_score(coef, species, spot_type=None):
     if coef is None:
         return 5.0
     c = float(coef)
 
     if species == "Daurade royale":
-        # La documentation trouvée est partagée entre deux écoles : morte-eau
-        # (coefficient bas, pêche au posé prolongée, pic documenté ~50) et
-        # gros coefficient (daurade plus agressive, pic documenté ~95). Plutôt
-        # que trancher arbitrairement, on retient le meilleur des deux
-        # courbes — un creux réel autour de 70-75 (coefficient moyen, ni
-        # franchement morte-eau ni vive-eau) reste correct sans être optimal.
+        # Deux écoles documentées : morte-eau (pic ~50, pêche au posé
+        # prolongée) et gros coefficient (pic ~95, daurade plus agressive).
+        # S'ajoute un plateau 60-90 : le guide Carnet de Pêche (Penhors,
+        # plage à daurade et bar) donne 60-90 comme idéal — ce qui comble
+        # l'ancien creux à 70-75. Un seul point de donnée pour la daurade,
+        # donc plateau volontairement un peu sous le maximum (9,5).
         s_morte_eau = 10 - abs(c - 50) / 10
         s_vive_eau = 10 - abs(c - 95) / 10
-        return clamp(max(s_morte_eau, s_vive_eau))
-    else:
-        # Bar : courant utile mais éviter de considérer les très gros coeffs
-        # automatiquement meilleurs.
-        return clamp(10 - abs(c - 78) / 16)
+        s_plateau = 9.5 - max(0.0, 60 - c, c - 90) / 10
+        return clamp(max(s_morte_eau, s_vive_eau, s_plateau))
+
+    anchors = BAR_COEF_ANCHORS.get(spot_type) or BAR_COEF_ANCHORS["generic"]
+    return clamp(_interp(c, anchors))
 
 
 def parse_extreme_datetime(ext):
@@ -707,7 +784,42 @@ def _to_paris_aware(ts):
     return ts.tz_convert("Europe/Paris")
 
 
-def tide_phase_score(dt, extrema, species):
+# Profils de score selon la position dans le cycle de marée
+# (0 = BM, 1 = PM, 2 = BM suivante ; un demi-cycle dure ~6h12).
+BAR_TIDE_PROFILE = [
+    (0.00, 4.5),   # étale de BM : pause
+    (0.15, 6.0),
+    (0.30, 8.5),   # ~2e heure de flot : courant établi
+    (0.50, 9.5),   # mi-montante
+    (0.80, 9.5),
+    (1.00, 8.0),   # étale de PM : encore correct (PM ±1h cité), un peu en retrait
+    (1.15, 8.5),   # début de descente
+    (1.30, 8.0),
+    (1.50, 6.5),   # mi-descente
+    (1.80, 5.0),
+    (2.00, 4.5),   # étale de BM
+]
+DAURADE_TIDE_PROFILE = [
+    (0.00, 4.5),
+    (0.40, 6.0),
+    (0.68, 9.0),   # ~2h avant la PM
+    (1.00, 10.0),  # pleine mer
+    (1.32, 9.0),   # ~2h après la PM
+    (1.60, 6.5),
+    (2.00, 5.0),
+]
+# Ajustements additifs du bar selon le type de poste, en fonction de la
+# position x dans le cycle (mêmes bornes 0..2, valeurs identiques en 0 et 2
+# pour rester continu à travers l'étale de BM).
+PLAGE_TIDE_ADJ = [(0.0, 0.0), (0.4, 0.0), (0.6, 0.8), (1.0, 0.8),
+                  (1.2, -0.6), (1.9, -0.6), (2.0, 0.0)]
+ESTUAIRE_TIDE_ADJ = [(0.0, 0.4), (0.15, -0.5), (0.9, -0.5), (1.1, 0.5),
+                     (1.4, 0.5), (1.6, 1.3), (1.9, 1.3), (2.0, 0.4)]
+# Pointe : en heures relatives à la PM (négatif = avant). Fenêtre −2h/+1h.
+POINTE_TIDE_ADJ = [(-2.5, 0.0), (-2.0, 0.8), (1.0, 0.8), (1.5, 0.0)]
+
+
+def tide_phase_score(dt, extrema, species, spot_type=None):
     """Retourne score, description, phase, distance au dernier événement."""
     if not extrema:
         return 5.0, "Marée indisponible", "Inconnue", None
@@ -746,34 +858,61 @@ def tide_phase_score(dt, extrema, species):
     # BM -> PM : montant
     # PM -> BM : descendant
     rising = prev[1] == "BM" and nxt[1] == "PM"
+    phase = "Montante" if rising else "Descendante"
 
-    if rising:
-        phase = "Montante"
-        # Bar : souvent très intéressant sur le flot, surtout avant PM.
-        # Daurade : privilégie ici les dernières heures du montant.
-        if species == "Bar":
-            s = 6 + 4 * frac
-        else:
-            s = 5 + 5 * frac
-    else:
-        phase = "Descendante"
-        if species == "Bar":
-            # Descendante peut rester productive ; moins forte par défaut.
-            s = 8 - 3 * frac
-        else:
-            s = 7 - 3 * frac
+    # Position dans le cycle : 0 = BM, 1 = PM, 2 = BM suivante.
+    x = frac if rising else 1.0 + frac
 
-    # Bonus explicite ±2h autour du pic de marée (PM ou BM, avant ou après) :
-    # la doc cite spécifiquement cette fenêtre comme celle du courant maximal,
-    # en plus du score de phase ci-dessus qui raisonne en % du cycle.
     minutes_to_next = (nxt[0] - dt).total_seconds() / 60
-    minutes_since_prev = (dt - prev[0]).total_seconds() / 60
-    near_peak = minutes_to_next <= 120 or minutes_since_prev <= 120
-    if near_peak:
-        s += 0.5
+    hours_to_pm = minutes_to_next / 60 if rising else None
+    hours_since_pm = elapsed if not rising else None
 
-    peak_note = " · pic à ±2h" if near_peak else ""
-    return clamp(s), f"{phase} — prochaine {nxt[1]} à {nxt[0].strftime('%H:%M')}{peak_note}", phase, minutes_to_next
+    notes = []
+    if species == "Bar":
+        # Profil recentré sur les guides Carnet de Pêche : meilleur créneau de
+        # la mi-montante au début de descente (« 2e et 3e heure » de flot ou
+        # de jusant = courant établi), étale = pause. Ancienne version : le
+        # score montait jusqu'au MAXIMUM pile à l'étale de PM et ajoutait un
+        # bonus autour des deux étales, à l'inverse de ce que décrivent les
+        # guides. Valeurs = ma quantification de descriptions qualitatives.
+        s = _interp(x, BAR_TIDE_PROFILE)
+
+        # Préférence de phase selon le type de poste (même source). Les
+        # ajustements passent par des ancres interpolées (pas de seuils
+        # brutaux) pour que le score horaire ne fasse pas de marches.
+        if spot_type == "plage":
+            # Plage : montante, surtout sa seconde moitié.
+            adj = _interp(x, PLAGE_TIDE_ADJ)
+            s += adj
+            if rising and adj >= 0.4:
+                notes.append("montante avancée, favorable en plage")
+        elif spot_type == "estuaire":
+            # Estuaire/goulet : descendante, surtout sa seconde moitié.
+            adj = _interp(x, ESTUAIRE_TIDE_ADJ)
+            s += adj
+            if not rising and x >= 1.55:
+                notes.append("fin de descendante, favorable en estuaire")
+        elif spot_type == "pointe":
+            # Pointe : de 2h avant la PM à 1h après (bords adoucis sur 30 min).
+            tau = -hours_to_pm if rising else hours_since_pm
+            adj = _interp(tau, POINTE_TIDE_ADJ)
+            s += adj
+            if adj >= 0.4:
+                notes.append("fenêtre PM −2h/+1h (pointe)")
+        elif spot_type == "digue":
+            # Digue : « toutes phases », les étales déclenchent souvent des
+            # touches → on aplatit le profil vers une valeur moyenne.
+            s = 0.5 * s + 0.5 * 7.5
+    else:
+        # Daurade : le guide Carnet de Pêche (surf) cible 2h avant à 2h après
+        # la pleine mer. Plus de décrochage brutal juste après la PM (ancien
+        # profil : 10 en fin de montante, 7 dès le début de descente).
+        s = _interp(x, DAURADE_TIDE_PROFILE)
+        if (rising and hours_to_pm <= 2.0) or (not rising and hours_since_pm <= 2.0):
+            notes.append("fenêtre PM ±2h")
+
+    note_txt = f" · {notes[0]}" if notes else ""
+    return clamp(s), f"{phase} — prochaine {nxt[1]} à {nxt[0].strftime('%H:%M')}{note_txt}", phase, minutes_to_next
 
 
 def historical_score(carnet, spot_id, species, technique, coef, dt):
@@ -1593,8 +1732,9 @@ def choose_best_window(df, species, technique, spot, tides_dict, carnet, shom_ds
         extrema = _extrema_window(tides_dict, date_key)
         tide_info_window = {**tide_info, "extrema": extrema}
 
-        phase_s, phase_desc, phase, _ = tide_phase_score(dt, extrema, species)
-        coef_s = continuous_coef_score(coef, species)
+        spot_t = spot_type_of(spot)
+        phase_s, phase_desc, phase, _ = tide_phase_score(dt, extrema, species, spot_type=spot_t)
+        coef_s = continuous_coef_score(coef, species, spot_type=spot_t)
 
         wind_kmh_val = safe_float(r.get("wind_speed_10m"))
         wind_s, wind_desc = wind_to_score(
@@ -2720,6 +2860,7 @@ with tab_spots:
         popup = (
             f"<b>{s['nom']}</b><br>"
             f"Fond : {s['fond']}<br>"
+            f"Type de poste : {s.get('type_poste', '—')}<br>"
             f"Orientation : {s['orientation']}°<br>"
             f"Indice spot {species} : {val}/10<br>"
             f"{s['notes']}<br>"
