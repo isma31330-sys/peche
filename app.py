@@ -2044,55 +2044,119 @@ def nearest_maree_site(lat, lon, sites):
     return best, best_dist
 
 
-def fetch_tides(site_slug, start_date, end_date):
-    if not API_KEY_MAREE:
-        return {}
+def _mask_secrets(text):
+    """Retire la clé API des messages d'erreur affichés dans l'interface :
+    requests inclut l'URL complète (clé comprise) dans ses messages HTTP et
+    de connexion, ce qui l'affichait en clair à l'écran."""
+    s = str(text)
+    if API_KEY_MAREE:
+        s = s.replace(API_KEY_MAREE, "***").replace(quote(API_KEY_MAREE), "***")
+    return re.sub(r"(key=)[^&\s'\"]+", r"\1***", s)
 
+
+@st.cache_resource
+def _tide_fallback_store():
+    """Mémoire du process : dernières marées valides par site, et horodatage
+    du dernier échec (évite de marteler l'API à chaque clic pendant une
+    panne)."""
+    return {"good": {}, "fail_ts": {}}
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def _fetch_tides_raw(site_slug, start_date, end_date):
+    """Appel réseau + mise en forme. LÈVE une exception en cas d'échec :
+    st.cache_data ne met pas en cache les exceptions, donc une panne
+    passagère de l'API ne reste pas figée pendant toute la durée du cache.
+    (L'ancienne version n'avait aucun cache : chaque clic dans l'appli
+    rappelait api-maree.fr.) Les erreurs serveur (5xx), le rate-limit (429)
+    et les coupures réseau sont réessayés ; une erreur 4xx (clé refusée,
+    site inconnu) est définitive et remontée tout de suite.
+    """
     url = (
         f"https://api-maree.fr/tide-extrema"
         f"?site={quote(str(site_slug))}"
         f"&from={start_date}&to={end_date}"
         f"&tz=Europe/Paris&key={quote(API_KEY_MAREE)}"
     )
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=15)
+    last = None
+    for attempt in range(3):
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=8)
+        except requests.RequestException as e:
+            last = e
+            time.sleep(1.0 * (attempt + 1))
+            continue
+        if r.status_code in (429, 500, 502, 503, 504):
+            last = RuntimeError(f"api-maree.fr a répondu HTTP {r.status_code}")
+            time.sleep(1.0 * (attempt + 1))
+            continue
         r.raise_for_status()
         data = r.json()
-        days = data if isinstance(data, list) else data.get("data", data.get("days", []))
-        out = {}
-        for day in days:
-            d = day.get("date") or day.get("day")
-            if not d:
-                continue
-            d = str(d).split("T")[0]
-            extrema = day.get("extrema", [])
-            coefs = [
-                safe_float(e.get("coef"))
-                for e in extrema
-                if e.get("type") == "PM" and safe_float(e.get("coef")) is not None
-            ]
-            # L'API renvoie "time" au format "HH:MM" SEUL, sans date. Sans
-            # correction, pd.to_datetime("HH:MM") complète silencieusement
-            # avec la date d'exécution du script au lieu de la date réelle
-            # de la marée, ce qui fait échouer l'encadrement PM/BM pour
-            # tous les jours autres que celui du run ("Phase incomplète").
-            # On reconstruit ici un horodatage complet jour + heure.
-            full_extrema = []
-            for e in extrema:
-                e = dict(e)
-                t = e.get("time")
-                if t and "T" not in str(t) and len(str(t)) <= 5:
-                    e["time"] = f"{d}T{t}:00"
-                full_extrema.append(e)
-            out[d] = {
-                "max_coef": max(coefs) if coefs else 70,
-                "extrema": full_extrema,
-            }
-        return out
-    except Exception as e:
-        st.warning(f"Marées indisponibles : {e}")
+        break
+    else:
+        raise last
+
+    days = data if isinstance(data, list) else data.get("data", data.get("days", []))
+    out = {}
+    for day in days:
+        d = day.get("date") or day.get("day")
+        if not d:
+            continue
+        d = str(d).split("T")[0]
+        extrema = day.get("extrema", [])
+        coefs = [
+            safe_float(e.get("coef"))
+            for e in extrema
+            if e.get("type") == "PM" and safe_float(e.get("coef")) is not None
+        ]
+        # L'API renvoie "time" au format "HH:MM" SEUL, sans date. Sans
+        # correction, pd.to_datetime("HH:MM") complète silencieusement
+        # avec la date d'exécution du script au lieu de la date réelle
+        # de la marée, ce qui fait échouer l'encadrement PM/BM pour
+        # tous les jours autres que celui du run ("Phase incomplète").
+        # On reconstruit ici un horodatage complet jour + heure.
+        full_extrema = []
+        for e in extrema:
+            e = dict(e)
+            t = e.get("time")
+            if t and "T" not in str(t) and len(str(t)) <= 5:
+                e["time"] = f"{d}T{t}:00"
+            full_extrema.append(e)
+        out[d] = {
+            "max_coef": max(coefs) if coefs else 70,
+            "extrema": full_extrema,
+        }
+    return out
+
+
+def fetch_tides(site_slug, start_date, end_date):
+    if not API_KEY_MAREE:
+        return {}
+    store = _tide_fallback_store()
+    stale = store["good"].get(site_slug)
+
+    # Panne récente : on ne retente pas à chaque clic pendant 90 s.
+    if time.time() - store["fail_ts"].get(site_slug, 0) < 90:
+        if stale:
+            st.warning("Marées : api-maree.fr indisponible — dernières marées connues utilisées.")
+            return stale
+        st.warning("Marées indisponibles : api-maree.fr ne répond pas, nouvelle tentative dans un instant.")
         return {}
 
+    try:
+        out = _fetch_tides_raw(site_slug, start_date, end_date)
+        if out:
+            store["good"][site_slug] = out
+            store["fail_ts"].pop(site_slug, None)
+        return out
+    except Exception as e:
+        store["fail_ts"][site_slug] = time.time()
+        msg = _mask_secrets(e)
+        if stale:
+            st.warning(f"Marées : api-maree.fr injoignable ({msg}) — dernières marées connues utilisées.")
+            return stale
+        st.warning(f"Marées indisponibles : {msg}")
+        return {}
 
 # -----------------------------
 # Cache partagé Supabase (météo / marine)
