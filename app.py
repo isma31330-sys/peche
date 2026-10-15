@@ -764,7 +764,10 @@ def parse_extreme_datetime(ext):
         if pd.isna(dt):
             return None
         if getattr(dt, "tzinfo", None) is None:
-            return dt.tz_localize("Europe/Paris")
+            # ambiguous/nonexistent explicites : sans eux, une heure répétée
+            # (passage à l'heure d'hiver) ou sautée (heure d'été) fait lever
+            # une ValueError et plante tout le calcul des créneaux.
+            return dt.tz_localize("Europe/Paris", ambiguous=True, nonexistent="shift_forward")
         return dt
     except Exception:
         return None
@@ -780,7 +783,14 @@ def _to_paris_aware(ts):
     """
     ts = pd.Timestamp(ts)
     if ts.tzinfo is None:
-        return ts.tz_localize("Europe/Paris")
+        # Dernier dimanche d'octobre : 02:xx existe deux fois (les prévisions
+        # horaires sont des heures locales sans fuseau) -> on retient la
+        # première occurrence (heure d'été), erreur d'au plus 1 h sur une
+        # heure de nuit, une fois par an. Dernier dimanche de mars : 02:xx
+        # n'existe pas -> on décale à l'heure valide suivante. Sans ces deux
+        # réglages, pandas lève une ValueError qui bloquait l'appli entière
+        # dès que la fenêtre de prévision touchait un changement d'heure.
+        return ts.tz_localize("Europe/Paris", ambiguous=True, nonexistent="shift_forward")
     return ts.tz_convert("Europe/Paris")
 
 
